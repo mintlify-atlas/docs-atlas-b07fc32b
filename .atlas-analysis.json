@@ -1,0 +1,71 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "Verity",
+  "projectDescription": "A sovereign, hardened Alpine Linux ISO that boots directly into nginx with a read-only root filesystem.",
+  "theme": "aspen",
+  "primaryColor": "#0a0a0a",
+  "lightColor": "#e5e5e5",
+  "darkColor": "#0a0a0a",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Getting Started",
+        "pages": [
+          "introduction",
+          "quickstart"
+        ]
+      },
+      {
+        "group": "Architecture",
+        "pages": [
+          "architecture/overview",
+          "architecture/boot-chain",
+          "architecture/security-model"
+        ]
+      },
+      {
+        "group": "Build & Deploy",
+        "pages": [
+          "build/requirements",
+          "build/building",
+          "build/testing",
+          "build/customization"
+        ]
+      },
+      {
+        "group": "Configuration",
+        "pages": [
+          "configuration/nginx",
+          "configuration/sysctl",
+          "configuration/init-system"
+        ]
+      },
+      {
+        "group": "Reference",
+        "pages": [
+          "reference/build-script",
+          "reference/initramfs",
+          "reference/project-structure"
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Read-only squashfs root filesystem",
+    "No package manager or shell access",
+    "Kernel hardening via sysctl",
+    "Nginx with security headers and rate limiting",
+    "Minimal attack surface (~400 lines of shell)",
+    "Bootable ISO under 100MB"
+  ],
+  "publicApiSurface": [
+    "make build - Build the ISO",
+    "make test - Test in QEMU",
+    "make clean - Clean build artifacts",
+    "scripts/build.sh - Main build script",
+    "scripts/initramfs-init - Initramfs initialization",
+    "config/init - PID 1 init script",
+    "config/nginx.conf - Nginx configuration",
+    "config/sysctl.conf - Kernel hardening parameters"
+  ]
+}
