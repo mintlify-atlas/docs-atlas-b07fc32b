@@ -7,7 +7,7 @@ Verity's boot process is designed to be simple, auditable, and secure. This page
 
 ## Boot sequence overview
 
-```
+```text
 BIOS → ISOLINUX → vmlinuz + initramfs
   → initramfs-init loads modules (squashfs, loop, isofs, sr_mod, virtio)
   → scans block devices for rootfs.squashfs
