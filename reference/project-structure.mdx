@@ -1,0 +1,427 @@
+---
+title: Project structure reference
+description: Complete reference for the Verity project layout and the purpose of each component
+---
+
+Verity's entire system is contained in a minimal set of configuration files and build scripts. The complete project is ~400 lines of shell script and configuration.
+
+## Directory layout
+
+```
+verity/
+├── scripts/
+│   ├── build.sh          # Main build orchestrator
+│   ├── initramfs-init    # Boot-time init script
+│   └── test.sh           # QEMU test helper
+├── config/
+│   ├── init              # PID 1 init for the real root
+│   ├── nginx.conf        # nginx configuration
+│   └── sysctl.conf       # Kernel hardening parameters
+├── www/
+│   └── index.html        # Default landing page
+├── Makefile              # Build orchestration
+├── README.md
+├── LICENSE
+└── .gitignore
+```
+
+## Scripts directory
+
+Contains all build and boot automation.
+
+### build.sh
+
+**Location:** `scripts/build.sh`
+
+**Purpose:** Main build script that creates the bootable ISO
+
+**What it does:**
+1. Downloads Alpine Linux minirootfs
+2. Installs packages (nginx, linux-lts, busybox-static)
+3. Builds custom initramfs with module loading
+4. Copies configuration files
+5. Hardens the system (removes apk, shells, unnecessary tools)
+6. Creates read-only squashfs from rootfs
+7. Configures ISOLINUX bootloader
+8. Generates final ISO image
+
+**Requirements:**
+- Must run as root (or via Docker on macOS)
+- Dependencies: `bash`, `wget`, `xorriso`, `squashfs-tools`, `cpio`, `syslinux`
+
+**Output:** `build/verity.iso`
+
+**Execution time:** 1-3 minutes
+
+<Accordion title="View key sections">
+```bash scripts/build.sh
+# Environment
+ALPINE_VERSION="3.21"
+WORK_DIR="/tmp/verity-build"
+OUTPUT_DIR="$PROJECT_DIR/build"
+
+# Package installation
+chroot "$WORK_DIR/rootfs" /bin/sh <<'CHROOT_EOF'
+apk add --no-cache nginx linux-lts busybox-static tzdata ca-certificates
+CHROOT_EOF
+
+# Hardening
+rm -f /sbin/apk /usr/bin/apk
+rm -rf /boot /lib/modules
+rm -f /usr/bin/wget /usr/bin/curl /usr/bin/vi /usr/bin/nano
+
+# Create squashfs
+mksquashfs "$WORK_DIR/rootfs" "$WORK_DIR/iso/rootfs.squashfs" -comp xz
+```
+</Accordion>
+
+### initramfs-init
+
+**Location:** `scripts/initramfs-init`
+
+**Purpose:** First userspace process that runs during boot
+
+**What it does:**
+1. Mounts `/proc`, `/sys`, `/dev`
+2. Loads kernel modules (squashfs, loop, isofs, virtio)
+3. Scans block devices for boot media
+4. Mounts the ISO and extracts squashfs
+5. Switches to the real root filesystem
+
+**When it runs:** Immediately after kernel boot, before the real init
+
+**Environment:** Minimal busybox-only environment (no libc dependencies)
+
+<Accordion title="View module loading">
+```sh scripts/initramfs-init
+echo "verity-initramfs: loading modules"
+
+for mod in squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi; do
+    /bin/busybox modprobe "$mod" 2>/dev/null || true
+done
+```
+</Accordion>
+
+<Accordion title="View boot media scanning">
+```sh scripts/initramfs-init
+echo "verity-initramfs: scanning for boot media"
+
+for dev in /dev/sr0 /dev/vda /dev/vdb /dev/sda /dev/sdb; do
+    [ -b "$dev" ] || continue
+    if /bin/busybox mount -t iso9660 -o ro "$dev" /tmp/mnt 2>/dev/null; then
+        if [ -f /tmp/mnt/rootfs.squashfs ]; then
+            FOUND="$dev"
+            break
+        fi
+        /bin/busybox umount /tmp/mnt
+    fi
+done
+```
+</Accordion>
+
+### test.sh
+
+**Location:** `scripts/test.sh`
+
+**Purpose:** QEMU test helper for local development
+
+**What it does:**
+- Boots the ISO in QEMU
+- Forwards port 8080 to the VM's port 80
+- Enables serial console output
+
+**Usage:**
+```bash
+make test
+# or
+bash scripts/test.sh
+```
+
+**Requirements:** `qemu-system-x86_64`
+
+## Config directory
+
+Contains all runtime configuration files that are copied into the root filesystem.
+
+### init
+
+**Location:** `config/init`
+
+**Purpose:** PID 1 init script for the real root filesystem
+
+**What it does:**
+1. Mounts essential filesystems (`/proc`, `/sys`, `/dev`)
+2. Creates writable tmpfs mounts (`/tmp`, `/var/log`, `/run`)
+3. Remounts root as read-only
+4. Brings up networking (loopback + DHCP)
+5. Applies sysctl hardening
+6. Execs nginx (becomes PID 1)
+
+**When it runs:** After initramfs switches root
+
+**Final state:** nginx is the only running process
+
+<Accordion title="View complete init script">
+```sh config/init
+#!/bin/sh
+
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+# Writable tmpfs mounts
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /var/log/nginx /run/nginx
+
+# Remount root as read-only
+mount -o remount,ro /
+
+# Networking
+ip link set lo up
+ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -s /usr/share/udhcpc/default.script -b -q 2>/dev/null
+
+# Apply sysctl hardening
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+
+echo "verity: starting nginx"
+
+# Exec replaces this process — nginx becomes PID 1
+exec nginx -g "daemon off;"
+```
+</Accordion>
+
+<Note>
+Using `exec` causes nginx to replace the init process, becoming PID 1 directly. There's no process supervisor — if nginx stops, the system halts.
+</Note>
+
+### nginx.conf
+
+**Location:** `config/nginx.conf`
+
+**Purpose:** nginx web server configuration
+
+**Key features:**
+- Listens on port 80 (IPv4 + IPv6)
+- Serves files from `/var/www/html`
+- Security headers (CSP, X-Frame-Options, etc.)
+- Rate limiting (10 req/s per IP)
+- Hides server version
+- Gzip compression enabled
+
+**Copied to:** `/etc/nginx/nginx.conf`
+
+<Accordion title="View security headers">
+```nginx config/nginx.conf
+add_header X-Frame-Options "DENY" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "0" always;
+add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+```
+</Accordion>
+
+<Accordion title="View rate limiting">
+```nginx config/nginx.conf
+# Define rate limit zone (10 MB memory, 10 requests/second)
+limit_req_zone $binary_remote_addr zone=global:10m rate=10r/s;
+
+server {
+    # Apply rate limiting with burst allowance
+    limit_req zone=global burst=20 nodelay;
+}
+```
+</Accordion>
+
+### sysctl.conf
+
+**Location:** `config/sysctl.conf`
+
+**Purpose:** Kernel hardening parameters
+
+**Applied by:** `config/init` during boot
+
+**Key hardening:**
+- Disable kernel module loading after boot
+- Restrict ptrace to admin only
+- Disable kexec (prevents runtime kernel replacement)
+- Enable ASLR
+- Network hardening (disable redirects, source routing)
+- Disable IPv6
+
+**Copied to:** `/etc/sysctl.conf`
+
+<Accordion title="View critical settings">
+```conf config/sysctl.conf
+# Prevent kernel pointer leaks
+kernel.kptr_restrict = 2
+
+# Disable kernel module loading after boot
+kernel.modules_disabled = 1
+
+# Restrict ptrace to admin only
+kernel.yama.ptrace_scope = 2
+
+# Disable kexec (prevents runtime kernel replacement)
+kernel.kexec_load_disabled = 1
+
+# Enable ASLR (full randomization)
+kernel.randomize_va_space = 2
+```
+</Accordion>
+
+## www directory
+
+**Location:** `www/`
+
+**Purpose:** Static web content served by nginx
+
+**Contents:** Default `index.html` (can add any static files)
+
+**Copied to:** `/var/www/html/` in the root filesystem
+
+**Customization:**
+Replace or add files to this directory before building:
+
+```bash
+# Add your static site
+rm www/index.html
+cp -r my-site/* www/
+make build
+```
+
+<Note>
+All files in `www/` are baked into the read-only squashfs. To update content, you must rebuild the ISO.
+</Note>
+
+## Makefile
+
+**Location:** `Makefile`
+
+**Purpose:** Build orchestration and platform detection
+
+**Targets:**
+
+```makefile Makefile
+.PHONY: build test clean
+
+build:
+ifeq ($(shell uname), Darwin)
+	# macOS: run build in Docker
+	docker run --rm --privileged \
+		-v "$(CURDIR)":/verity \
+		alpine:3.21 \
+		sh -c "apk add bash wget xorriso squashfs-tools cpio syslinux && bash scripts/build.sh"
+else
+	# Linux: run build directly
+	sudo bash scripts/build.sh
+endif
+
+test:
+	bash scripts/test.sh
+
+clean:
+	rm -rf build/
+```
+
+**Platform handling:**
+- **macOS:** Runs build inside `alpine:3.21` Docker container
+- **Linux:** Runs build directly with sudo
+
+**Why Docker on macOS?**
+
+macOS lacks native Linux tools like `mksquashfs`, `xorriso`, and `chroot`. Docker provides a Linux environment for the build.
+
+## Build artifacts
+
+The build process generates the following:
+
+```
+build/
+└── verity.iso        # Final bootable ISO (~50-100 MB)
+```
+
+Intermediate build artifacts are stored in `/tmp/verity-build/` and cleaned up after the build.
+
+## Boot chain overview
+
+```
+BIOS/UEFI
+    ↓
+ISOLINUX (boot/isolinux/isolinux.bin)
+    ↓
+Kernel (boot/vmlinuz)
+    ↓
+Initramfs (boot/initramfs.gz)
+    → scripts/initramfs-init
+        → Load modules
+        → Find boot media
+        → Mount squashfs
+        → switch_root
+    ↓
+Real root (/newroot → /)
+    → config/init (PID 1)
+        → Mount filesystems
+        → Bring up networking
+        → Apply sysctl hardening
+        → exec nginx
+    ↓
+nginx (PID 1)
+    → Serves files from /var/www/html
+```
+
+## File ownership
+
+All files in the repository should have these permissions:
+
+| File | Permissions | Owner |
+|------|-------------|-------|
+| `scripts/*.sh` | `755` (executable) | User |
+| `scripts/initramfs-init` | `755` (executable) | User |
+| `config/init` | `755` (executable) | User |
+| `config/*.conf` | `644` (readable) | User |
+| `www/*` | `644` (readable) | User |
+| `Makefile` | `644` (readable) | User |
+
+<Warning>
+Do not commit build artifacts (`build/`) to version control. Add `build/` to `.gitignore`.
+</Warning>
+
+## Customization points
+
+You can customize Verity without modifying core build logic:
+
+<Accordion title="Change web content">
+Replace files in `www/` directory:
+```bash
+rm www/index.html
+cp -r my-site/* www/
+make build
+```
+</Accordion>
+
+<Accordion title="Modify nginx config">
+Edit `config/nginx.conf` to change ports, add virtual hosts, etc.
+</Accordion>
+
+<Accordion title="Adjust kernel hardening">
+Edit `config/sysctl.conf` to enable/disable specific hardening options.
+</Accordion>
+
+<Accordion title="Add kernel modules">
+Edit `scripts/build.sh` and `scripts/initramfs-init` to include additional modules:
+```bash
+MODULES="squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi e1000"
+```
+</Accordion>
+
+<Accordion title="Install additional packages">
+Edit the `apk add` command in `scripts/build.sh`:
+```bash
+apk add --no-cache nginx linux-lts busybox-static tzdata ca-certificates your-package
+```
+</Accordion>

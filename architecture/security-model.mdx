@@ -1,0 +1,520 @@
+---
+title: Security model
+description: Comprehensive documentation of Verity's security hardening measures
+---
+
+Verity's security model is based on defense in depth through minimalism. By eliminating unnecessary components and hardening what remains, the attack surface is reduced to the smallest possible footprint.
+
+## Security principles
+
+Verity's security architecture follows three core principles:
+
+<Steps>
+  <Step title="Least privilege">
+    Every component runs with the minimum permissions required. nginx runs as an unprivileged user.
+  </Step>
+  
+  <Step title="Defense in depth">
+    Multiple layers of hardening protect against different attack vectors: kernel hardening, read-only filesystem, network security, and application-layer protections.
+  </Step>
+  
+  <Step title="Fail-secure">
+    If a critical component fails, the system halts rather than entering an undefined state. nginx runs as PID 1 — if it crashes, the kernel panics.
+  </Step>
+</Steps>
+
+## Read-only filesystem
+
+The foundation of Verity's security is the immutable root filesystem.
+
+### Squashfs by nature
+
+The root filesystem is squashfs, a compressed read-only filesystem:
+
+```bash
+# From scripts/build.sh:194-196
+log "Creating squashfs"
+mksquashfs "$WORK_DIR/rootfs" "$WORK_DIR/iso/rootfs.squashfs" \
+    -comp xz -noappend -quiet
+```
+
+Unlike traditional filesystems made read-only via mount options, squashfs is **structurally immutable**. There is no `remount,rw` — the format itself doesn't support writes.
+
+### Explicit remount enforcement
+
+During boot, the root is explicitly remounted read-only:
+
+```bash
+# From config/init:17-18
+# Remount root as read-only
+mount -o remount,ro /
+```
+
+This ensures the policy is enforced even if the mount state is ambiguous.
+
+### Writable tmpfs for runtime data
+
+While the root is immutable, nginx needs writable directories:
+
+```bash
+# From config/init:11-15
+# Writable tmpfs mounts
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /var/log/nginx /run/nginx
+```
+
+These tmpfs mounts are:
+- **Ephemeral**: Cleared on reboot
+- **Isolated**: Cannot affect the root filesystem
+- **Hardened**: `nosuid` prevents privilege escalation, `nodev` prevents device files
+
+<Note>
+Logs written to `/var/log/nginx` exist only in RAM and are lost on reboot. For persistent logging, configure nginx to log to a remote syslog server.
+</Note>
+
+## Kernel hardening
+
+Verity applies extensive kernel hardening via sysctl parameters in `/etc/sysctl.conf`.
+
+### Prevent information leaks
+
+```bash
+# From config/sysctl.conf:3-7
+# Prevent kernel pointer leaks
+kernel.kptr_restrict = 2
+
+# Restrict access to kernel logs
+kernel.dmesg_restrict = 1
+```
+
+- `kptr_restrict = 2`: Hide kernel pointers from all users, even root. Prevents KASLR bypass attacks.
+- `dmesg_restrict = 1`: Prevent unprivileged users from reading kernel logs via `dmesg`.
+
+### Disable runtime modification
+
+```bash
+# From config/sysctl.conf:9-16
+# Disable kernel module loading after boot
+kernel.modules_disabled = 1
+
+# Restrict ptrace to admin only
+kernel.yama.ptrace_scope = 2
+
+# Disable kexec (prevents runtime kernel replacement)
+kernel.kexec_load_disabled = 1
+```
+
+<Accordion title="Why disable module loading?">
+Once the system finishes booting, all necessary kernel modules are loaded. Preventing further module loading stops attackers from injecting malicious kernel code, even with root access.
+
+This is applied **after** the initramfs loads essential modules (squashfs, virtio, etc.).
+</Accordion>
+
+<Accordion title="What is ptrace_scope = 2?">
+`ptrace` allows one process to inspect and control another. Setting `ptrace_scope = 2` restricts this to processes with `CAP_SYS_PTRACE` capability.
+
+This prevents:
+- Debugging nginx to extract memory contents
+- Injecting code into running processes
+- Privilege escalation via process manipulation
+</Accordion>
+
+<Accordion title="Why disable kexec?">
+`kexec` allows replacing the running kernel without a full reboot. While useful for fast reboots, it also allows an attacker with root access to bypass secure boot and load a malicious kernel.
+
+Disabling kexec ensures the kernel loaded at boot is the kernel that runs until shutdown.
+</Accordion>
+
+### Enable ASLR
+
+```bash
+# From config/sysctl.conf:18-19
+# Enable ASLR (full randomization)
+kernel.randomize_va_space = 2
+```
+
+Address Space Layout Randomization (ASLR) randomizes memory addresses, making exploits harder to execute reliably.
+
+### Network hardening
+
+Verity includes comprehensive network-level protections:
+
+#### Reverse-path filtering
+
+```bash
+# From config/sysctl.conf:21-23
+# Network hardening — reverse-path filtering (strict mode)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+```
+
+Drops packets from IP addresses that would be unreachable via the interface they arrived on. Prevents IP spoofing.
+
+#### Disable source routing
+
+```bash
+# From config/sysctl.conf:25-27
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+```
+
+Source routing allows packets to specify their own route through the network. This is almost never legitimate and is used in attacks.
+
+#### Disable ICMP redirects
+
+```bash
+# From config/sysctl.conf:29-37
+# Disable ICMP redirects (prevent MitM route injection)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+```
+
+ICMP redirects can be used in man-in-the-middle attacks to reroute traffic through an attacker's machine.
+
+#### Ignore ICMP ping requests
+
+```bash
+# From config/sysctl.conf:39-40
+# Ignore ICMP ping requests
+net.ipv4.icmp_echo_ignore_all = 1
+```
+
+Prevents the server from responding to ping. Reduces reconnaissance surface.
+
+#### SYN flood protection
+
+```bash
+# From config/sysctl.conf:42-43
+# Enable SYN cookies for SYN flood protection
+net.ipv4.tcp_syncookies = 1
+```
+
+SYN cookies protect against SYN flood denial-of-service attacks by synthesizing connection state instead of allocating resources.
+
+#### Disable IPv6
+
+```bash
+# From config/sysctl.conf:45-47
+# Disable IPv6
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+```
+
+IPv6 is disabled by default. If you need IPv6, comment out these lines before building.
+
+### Filesystem hardening
+
+```bash
+# From config/sysctl.conf:49-52
+# File system hardening
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+```
+
+- `protected_hardlinks = 1`: Prevents hardlink attacks where an attacker creates a hardlink to a file they can't write, then waits for permissions to change.
+- `protected_symlinks = 1`: Prevents symlink attacks in world-writable directories like `/tmp`.
+- `suid_dumpable = 0`: Prevents core dumps of setuid programs, which could leak sensitive data.
+
+### Restrict core dumps
+
+```bash
+# From config/sysctl.conf:54-55
+# Restrict core dumps
+kernel.core_uses_pid = 1
+```
+
+Appends the PID to core dump filenames, preventing core file collisions.
+
+## nginx security configuration
+
+The nginx configuration includes multiple layers of protection.
+
+### Security headers
+
+```nginx
+# From config/nginx.conf:50-56
+# Security headers
+add_header X-Frame-Options "DENY" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "0" always;
+add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+```
+
+<Accordion title="X-Frame-Options: DENY">
+Prevents the site from being embedded in an iframe, protecting against clickjacking attacks.
+</Accordion>
+
+<Accordion title="X-Content-Type-Options: nosniff">
+Prevents browsers from MIME-sniffing responses, forcing them to respect declared content types. Stops attacks that rely on browsers misinterpreting file types.
+</Accordion>
+
+<Accordion title="X-XSS-Protection: 0">
+Disables the legacy XSS filter. Modern browsers have deprecated this feature because it can be exploited. CSP provides better protection.
+</Accordion>
+
+<Accordion title="Content-Security-Policy">
+Defines what resources the browser is allowed to load:
+- `default-src 'none'`: Block everything by default
+- `style-src 'unsafe-inline'`: Allow inline styles (for minimal HTML styling)
+- `img-src 'self'`: Allow images only from the same origin
+
+No scripts, no external resources, no plugins.
+</Accordion>
+
+<Accordion title="Referrer-Policy: strict-origin-when-cross-origin">
+Controls what referrer information is sent with requests. Sends full URL for same-origin, only origin for cross-origin.
+</Accordion>
+
+<Accordion title="Permissions-Policy">
+Disables browser features that static file serving doesn't need: camera, microphone, geolocation.
+</Accordion>
+
+### Rate limiting
+
+```nginx
+# From config/nginx.conf:34-35, 58-59
+# Rate limiting
+limit_req_zone $binary_remote_addr zone=global:10m rate=10r/s;
+
+# (later in server block)
+limit_req zone=global burst=20 nodelay;
+```
+
+Limits each IP address to:
+- **Base rate**: 10 requests per second
+- **Burst**: Up to 20 requests can be queued
+- **No delay**: Bursts are processed immediately (not throttled)
+
+This protects against:
+- Denial-of-service attacks
+- Brute-force attacks
+- Resource exhaustion
+
+### Hide server version
+
+```nginx
+# From config/nginx.conf:25-26
+# Hide nginx version
+server_tokens off;
+```
+
+Prevents nginx from advertising its version in response headers and error pages. Reduces information available to attackers.
+
+### Request size and timeout limits
+
+```nginx
+# From config/nginx.conf:28-32
+# Request limits
+client_max_body_size 1m;
+client_body_timeout 10s;
+client_header_timeout 10s;
+send_timeout 10s;
+```
+
+- `client_max_body_size 1m`: Reject requests larger than 1 MB (static sites don't need large uploads)
+- Aggressive timeouts prevent slowloris-style attacks that hold connections open
+
+### Deny hidden files
+
+```nginx
+# From config/nginx.conf:65-70
+# Deny access to hidden files
+location ~ /\. {
+    deny all;
+    access_log off;
+    log_not_found off;
+}
+```
+
+Prevents access to dotfiles like `.git`, `.env`, `.htaccess` that might accidentally be included in `/var/www/html`.
+
+## Removed attack surfaces
+
+Security is as much about what's **not** included as what is.
+
+### No package manager
+
+```bash
+# From scripts/build.sh:166-167
+# Remove package manager
+rm -f /sbin/apk /usr/bin/apk
+```
+
+Without apk, even an attacker with root access cannot install tools, backdoors, or dependencies.
+
+### No debugging tools
+
+```bash
+# From scripts/build.sh:172-174
+# Remove unnecessary tools
+rm -f /usr/bin/wget /usr/bin/curl /usr/bin/vi /usr/bin/nano
+rm -f /usr/bin/strace /usr/bin/gdb
+```
+
+No wget/curl: Can't download payloads from external servers.
+No editors: Can't modify configurations (even if filesystem were writable).
+No debuggers: Can't inspect or modify running processes.
+
+### No kernel sources or modules
+
+```bash
+# From scripts/build.sh:169-170
+# Remove kernel source + modules (already extracted to initramfs)
+rm -rf /boot /lib/modules
+```
+
+All necessary kernel modules are in the initramfs. The main system has no module files, preventing module injection even if `modules_disabled` were bypassed.
+
+### No documentation
+
+```bash
+# From scripts/build.sh:176-177
+# Remove docs
+rm -rf /usr/share/man /usr/share/doc
+```
+
+Man pages and documentation consume space and can leak information about installed software versions.
+
+## What makes the system "sovereign"
+
+Sovereignty in Verity means:
+
+<Steps>
+  <Step title="You control what runs">
+    The ISO you build is the exact system that boots. No package repositories, no update mechanisms, no remote control.
+  </Step>
+  
+  <Step title="Nothing can be changed at runtime">
+    Read-only root, disabled module loading, no package manager — the running system cannot be modified.
+  </Step>
+  
+  <Step title="No ambient authority">
+    Even root cannot load modules, modify the kernel, or install software. Authority is restricted by design, not by policy.
+  </Step>
+  
+  <Step title="Complete transparency">
+    The entire system is ~400 lines of shell. You can read and audit all of it.
+  </Step>
+  
+  <Step title="Fail-secure behavior">
+    If nginx crashes, the system halts. There is no fallback shell, no recovery mode, no undefined state.
+  </Step>
+</Steps>
+
+## Threat model
+
+### What Verity protects against
+
+<Check>Remote code execution in nginx (RCE)</Check>
+- Attacker gains nginx process permissions but:
+  - Cannot modify the filesystem (read-only root)
+  - Cannot install tools (no package manager)
+  - Cannot load kernel modules (modules_disabled)
+  - Cannot pivot to another process (no shells, limited binaries)
+
+<Check>Privilege escalation</Check>
+- Even with root:
+  - Cannot modify system files (read-only)
+  - Cannot load malicious kernel modules (modules_disabled)
+  - Cannot replace the kernel (kexec_load_disabled)
+  - Cannot install persistence mechanisms (no package manager, ephemeral tmpfs)
+
+<Check>Network-based attacks</Check>
+- DDoS: Rate limiting and SYN cookies provide basic protection
+- Reconnaissance: Server tokens off, ICMP disabled, minimal exposed services
+- MitM: ICMP redirects disabled, source routing disabled
+
+<Check>Supply chain attacks</Check>
+- Build from source with verified Alpine base
+- No runtime dependencies on external repositories
+- Reproducible builds (deterministic ISO generation)
+
+### What Verity does NOT protect against
+
+<Warning>Physical access</Warning>
+An attacker with physical access can:
+- Boot from alternative media
+- Modify the ISO before deployment
+- Extract the squashfs and modify it offline
+
+Mitigation: Use disk encryption, secure boot, and physical security controls.
+
+<Warning>Kernel vulnerabilities</Warning>
+A kernel exploit could:
+- Bypass all userspace protections
+- Disable hardening features
+- Achieve arbitrary code execution
+
+Mitigation: Keep the Alpine base updated. Rebuild ISOs regularly to incorporate kernel patches.
+
+<Warning>nginx 0-day vulnerabilities</Warning>
+An unknown nginx vulnerability could:
+- Achieve remote code execution
+- Bypass application-layer controls
+
+Mitigation: Monitor nginx security advisories. Rebuild with updated nginx versions.
+
+<Warning>Denial of service</Warning>
+Rate limiting provides basic protection, but:
+- A distributed attack can still overwhelm the server
+- Resource exhaustion (CPU, memory) is still possible
+
+Mitigation: Deploy behind a CDN or DDoS protection service.
+
+## Security checklist
+
+When deploying Verity in production:
+
+<Steps>
+  <Step title="Verify the Alpine base">
+    Check SHA256 sums of downloaded Alpine artifacts during build.
+    
+    ```bash
+    # From scripts/build.sh:63
+    sha256sum -c "${ROOTFS_TAR}.sha256" || error "Checksum verification failed"
+    ```
+  </Step>
+  
+  <Step title="Audit custom content">
+    Review all files in `www/` before building. Ensure no secrets, credentials, or sensitive data are included.
+  </Step>
+  
+  <Step title="Enable persistent logging">
+    Configure nginx to send logs to a remote syslog server (logs in `/var/log/nginx` are ephemeral).
+  </Step>
+  
+  <Step title="Network security">
+    - Deploy behind a reverse proxy or CDN for additional DDoS protection
+    - Use TLS termination at the load balancer (Verity serves HTTP only)
+    - Restrict network access to required ports only (80/443)
+  </Step>
+  
+  <Step title="Monitor and update">
+    - Subscribe to Alpine Linux security announcements
+    - Rebuild ISOs regularly to incorporate security patches
+    - Test new ISOs in staging before production deployment
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Boot chain" icon="link" href="/architecture/boot-chain">
+    Understand the boot process and system initialization
+  </Card>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    Return to the architecture overview
+  </Card>
+</CardGroup>

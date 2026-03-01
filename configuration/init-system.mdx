@@ -1,0 +1,200 @@
+---
+title: Init system configuration
+description: Minimal PID 1 init process that configures the system and launches nginx
+---
+
+Verity uses a minimal custom init system instead of traditional init systems like systemd or OpenRC. The init script (`config/init`) runs as PID 1, configures the system, and then replaces itself with nginx.
+
+## Init script
+
+The complete init script:
+
+```sh config/init
+#!/bin/sh
+
+# Verity — PID 1 init
+# Brings up networking, applies hardening, runs nginx as the only service.
+
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+# Writable tmpfs mounts
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /var/log/nginx /run/nginx
+
+# Remount root as read-only
+mount -o remount,ro /
+
+# Networking
+ip link set lo up
+ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -s /usr/share/udhcpc/default.script -b -q 2>/dev/null
+
+# Apply sysctl hardening
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+
+echo "verity: starting nginx"
+
+# Exec replaces this process — nginx becomes PID 1
+exec nginx -g "daemon off;"
+```
+
+## Boot sequence
+
+The init process follows a carefully ordered sequence:
+
+### 1. Mount essential filesystems
+
+```sh config/init:7-9
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+```
+
+Mounts the fundamental kernel filesystems:
+- **proc**: Process information and kernel interfaces
+- **sysfs**: Device and driver information
+- **devtmpfs**: Device nodes automatically populated by the kernel
+
+### 2. Create writable tmpfs mounts
+
+```sh config/init:12-15
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /var/log/nginx /run/nginx
+```
+
+Creates RAM-backed temporary filesystems for runtime data. The root filesystem is read-only, so any writable storage must be tmpfs.
+
+<Accordion title="Mount options explained">
+  - **mode=1777**: World-writable with sticky bit (for /tmp)
+  - **mode=0755**: Only root can write (for /var/log and /run)
+  - **nosuid**: Ignore setuid/setgid bits (security hardening)
+  - **nodev**: Don't allow device nodes (security hardening)
+</Accordion>
+
+<Warning>
+  All data in tmpfs is lost on reboot. Logs and runtime files are not persisted.
+</Warning>
+
+### 3. Remount root as read-only
+
+```sh config/init:18
+mount -o remount,ro /
+```
+
+Remounts the root filesystem in read-only mode. This provides several security benefits:
+- Prevents unauthorized file modification
+- Protects against some classes of malware
+- Makes the filesystem immutable at runtime
+- Improves integrity guarantees
+
+### 4. Configure networking
+
+```sh config/init:21-23
+ip link set lo up
+ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -s /usr/share/udhcpc/default.script -b -q 2>/dev/null
+```
+
+**Loopback interface**: Brings up `lo` for local connections.
+
+**Ethernet interface**: Brings up `eth0`. The `2>/dev/null` suppresses errors if eth0 doesn't exist.
+
+**DHCP client**: Runs `udhcpc` (BusyBox DHCP client) to obtain IP address:
+- `-i eth0`: Interface to configure
+- `-s /usr/share/udhcpc/default.script`: Script that applies DHCP configuration
+- `-b`: Background mode (daemonize)
+- `-q`: Quiet mode (minimal output)
+
+<Note>
+  The DHCP client runs in background mode and continues running after nginx starts to maintain the lease.
+</Note>
+
+### 5. Apply kernel hardening
+
+```sh config/init:26
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+```
+
+Loads all sysctl parameters from `/etc/sysctl.conf`. See [Kernel hardening via sysctl](/configuration/sysctl) for details on what each parameter does.
+
+The `|| true` ensures the boot process continues even if some sysctl settings fail to apply.
+
+### 6. Replace init with nginx
+
+```sh config/init:31
+exec nginx -g "daemon off;"
+```
+
+The `exec` command replaces the current process (the init script) with nginx. This is why nginx becomes PID 1.
+
+## Why nginx becomes PID 1
+
+Using `exec` to replace the init process has several implications:
+
+**No process supervisor**: There's no process manager watching nginx. If nginx crashes, the kernel panics because PID 1 exited.
+
+**Minimal overhead**: No init daemon consuming resources. The only user-space process is nginx.
+
+**Simplified architecture**: One process doing one job. No complex service management.
+
+**Security benefit**: Smaller attack surface. No init daemon to exploit.
+
+<Warning>
+  The `-g "daemon off;"` flag is critical. It keeps nginx in the foreground. If nginx daemonizes, PID 1 exits and the kernel panics.
+</Warning>
+
+## Comparison with traditional init
+
+| Traditional init (systemd/OpenRC) | Verity init |
+|-----------------------------------|-------------|
+| Complex multi-process supervisor | Single init script |
+| Manages multiple services | Launches one service (nginx) |
+| Stays running as PID 1 | Replaced by nginx |
+| Thousands of lines of code | 32 lines of shell script |
+| Service dependencies and ordering | No dependency management needed |
+| Logging, resource limits, restarts | No process management |
+
+## Boot process overview
+
+The complete boot sequence from power-on to serving HTTP:
+
+1. **Kernel loads** and mounts initramfs
+2. **Initramfs init** (`scripts/initramfs-init`) finds boot media and mounts squashfs
+3. **Pivot root** switches to the real filesystem
+4. **System init** (`config/init`) runs as PID 1
+5. **Filesystems mounted** (proc, sys, dev, tmpfs)
+6. **Root remounted read-only**
+7. **Networking configured** (loopback + DHCP)
+8. **Kernel hardened** (sysctl parameters)
+9. **Nginx launched** and becomes PID 1
+10. **HTTP server ready**
+
+The entire boot process typically completes in under 2 seconds on modern hardware.
+
+## Initramfs init
+
+Before the system init runs, the initramfs init (`scripts/initramfs-init`) handles early boot:
+
+```sh scripts/initramfs-init:1-4
+#!/bin/sh
+
+# Verity — initramfs init
+# Loads modules, finds boot media, mounts squashfs, pivot-roots into the real system.
+```
+
+The initramfs init is responsible for:
+1. Mounting early filesystems (proc, sys, dev)
+2. Loading kernel modules (squashfs, virtio, etc.)
+3. Scanning for boot media containing `rootfs.squashfs`
+4. Mounting the squashfs root filesystem
+5. Pivot-rooting into the real system
+6. Executing the system init (`/sbin/init`)
+
+See the [Build process](/internals/build-process) documentation for more details on how the initramfs is constructed.

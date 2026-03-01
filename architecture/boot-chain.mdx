@@ -1,0 +1,310 @@
+---
+title: Boot chain
+description: Detailed documentation of the boot process from BIOS to nginx
+---
+
+Verity's boot process is designed to be simple, auditable, and secure. This page documents the complete boot chain from power-on to the running nginx server.
+
+## Boot sequence overview
+
+```
+BIOS → ISOLINUX → vmlinuz + initramfs
+  → initramfs-init loads modules (squashfs, loop, isofs, sr_mod, virtio)
+  → scans block devices for rootfs.squashfs
+  → mounts squashfs read-only → switch_root
+  → /sbin/init brings up networking, applies sysctl
+  → exec nginx (becomes PID 1)
+```
+
+## Stage 1: BIOS and bootloader
+
+When the system boots from the Verity ISO:
+
+<Steps>
+  <Step title="BIOS loads ISOLINUX">
+    The BIOS reads the ISO's boot sector and loads the ISOLINUX bootloader.
+  </Step>
+  
+  <Step title="ISOLINUX configuration">
+    ISOLINUX reads its configuration and prepares to load the kernel.
+    
+    ```bash
+    # From scripts/build.sh:203-209 (isolinux.cfg)
+    DEFAULT verity
+    LABEL verity
+        LINUX /boot/vmlinuz
+        INITRD /boot/initramfs.gz
+        APPEND quiet
+    ```
+  </Step>
+  
+  <Step title="Kernel and initramfs loaded">
+    ISOLINUX loads the Linux kernel (vmlinuz) and the initial RAM filesystem (initramfs.gz) into memory.
+  </Step>
+</Steps>
+
+## Stage 2: Initramfs initialization
+
+The kernel boots and executes `/init` from the initramfs. This is a custom shell script that prepares the system.
+
+### Mount essential filesystems
+
+```bash
+# From scripts/initramfs-init:6-9
+/bin/busybox mkdir -p /proc /sys /dev /tmp /newroot
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev
+```
+
+These pseudo-filesystems are required for hardware discovery and device access.
+
+### Load kernel modules
+
+```bash
+# From scripts/initramfs-init:11-16
+echo "verity-initramfs: loading modules"
+
+# Load filesystem and block device modules
+for mod in squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi; do
+    /bin/busybox modprobe "$mod" 2>/dev/null || true
+done
+```
+
+These modules are essential for:
+- `squashfs`: Reading the compressed root filesystem
+- `loop`: Mounting files as block devices
+- `isofs`, `sr_mod`, `cdrom`: Reading ISO9660 filesystems
+- `virtio_*`: Virtual hardware support (for QEMU/KVM)
+
+<Note>
+After the system boots, `kernel.modules_disabled = 1` prevents loading any additional modules.
+</Note>
+
+### Scan for boot media
+
+```bash
+# From scripts/initramfs-init:21-35
+echo "verity-initramfs: scanning for boot media"
+
+# Scan block devices for our squashfs
+FOUND=""
+for dev in /dev/sr0 /dev/vda /dev/vdb /dev/sda /dev/sdb; do
+    [ -b "$dev" ] || continue
+    /bin/busybox mkdir -p /tmp/mnt
+    if /bin/busybox mount -t iso9660 -o ro "$dev" /tmp/mnt 2>/dev/null; then
+        if [ -f /tmp/mnt/rootfs.squashfs ]; then
+            FOUND="$dev"
+            break
+        fi
+        /bin/busybox umount /tmp/mnt
+    fi
+done
+```
+
+The script scans common block device paths to locate the ISO containing `rootfs.squashfs`.
+
+<Warning>
+If `rootfs.squashfs` is not found, the system drops to an emergency shell. In production, this indicates a boot media failure.
+</Warning>
+
+### Mount the squashfs root
+
+```bash
+# From scripts/initramfs-init:47-49
+# Mount the squashfs
+/bin/busybox losetup /dev/loop0 /tmp/mnt/rootfs.squashfs
+/bin/busybox mount -t squashfs -o ro /dev/loop0 /newroot
+```
+
+The squashfs image is attached to a loop device and mounted read-only at `/newroot`.
+
+### Switch to the real root
+
+```bash
+# From scripts/initramfs-init:57-64
+echo "verity-initramfs: switching root"
+
+# Clean up initramfs mounts
+/bin/busybox umount /proc
+/bin/busybox umount /sys
+/bin/busybox umount /dev
+
+exec /bin/busybox switch_root /newroot /sbin/init
+```
+
+`switch_root` pivots from the initramfs to the real root filesystem and executes `/sbin/init`.
+
+## Stage 3: System initialization
+
+The real root's `/sbin/init` is a custom shell script that completes system setup.
+
+### Mount essential filesystems
+
+```bash
+# From config/init:6-15
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+
+# Writable tmpfs mounts
+mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+mkdir -p /var/log/nginx /run/nginx
+```
+
+While the root filesystem is read-only, nginx needs writable directories for:
+- `/tmp`: Temporary files
+- `/var/log/nginx`: Access and error logs
+- `/run/nginx`: PID file and runtime state
+
+These are mounted as tmpfs (in-memory filesystems) with security flags:
+- `nosuid`: Prevent setuid binaries
+- `nodev`: Prevent device files
+- `mode=1777` for `/tmp`: Sticky bit for multi-user safety
+
+### Remount root as read-only
+
+```bash
+# From config/init:17-18
+# Remount root as read-only
+mount -o remount,ro /
+```
+
+This ensures the root filesystem is explicitly read-only, even though squashfs is already immutable.
+
+### Configure networking
+
+```bash
+# From config/init:20-23
+# Networking
+ip link set lo up
+ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -s /usr/share/udhcpc/default.script -b -q 2>/dev/null
+```
+
+<Steps>
+  <Step title="Bring up loopback">
+    Activates the `lo` interface for local communication.
+  </Step>
+  
+  <Step title="Bring up primary interface">
+    Activates `eth0` (or equivalent network interface).
+  </Step>
+  
+  <Step title="Obtain IP via DHCP">
+    Uses `udhcpc` (busybox DHCP client) to acquire an IP address in background mode.
+  </Step>
+</Steps>
+
+<Note>
+The `-b` flag backgrounds the DHCP client, and `-q` suppresses output. The system will attempt DHCP but won't block boot if it fails.
+</Note>
+
+### Apply kernel hardening
+
+```bash
+# From config/init:25-26
+# Apply sysctl hardening
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+```
+
+Loads kernel parameters from `/etc/sysctl.conf` to harden the system. See [Security model](/architecture/security-model) for details.
+
+## Stage 4: nginx as PID 1
+
+The final step is to replace the init process with nginx:
+
+```bash
+# From config/init:28-31
+echo "verity: starting nginx"
+
+# Exec replaces this process — nginx becomes PID 1
+exec nginx -g "daemon off;"
+```
+
+<Warning>
+The `exec` command **replaces** the current process. nginx becomes PID 1, the init process. If nginx crashes, the kernel will panic and the system will halt.
+</Warning>
+
+### Why nginx as PID 1?
+
+Running nginx as PID 1 is unconventional but intentional:
+
+1. **Minimal attack surface**: No init system, no service manager, no additional processes.
+2. **Fail-secure**: If nginx crashes, the system halts rather than entering an undefined state.
+3. **Simplicity**: No process supervision, no unnecessary abstractions.
+4. **Sovereignty**: The system does exactly one thing and cannot be repurposed.
+
+## Boot timeline
+
+Typical boot times (on QEMU with virtio):
+
+<Steps>
+  <Step title="0-2 seconds">
+    BIOS POST and ISOLINUX bootloader
+  </Step>
+  
+  <Step title="2-5 seconds">
+    Kernel initialization and initramfs execution
+  </Step>
+  
+  <Step title="5-7 seconds">
+    System initialization and DHCP
+  </Step>
+  
+  <Step title="7-8 seconds">
+    nginx starts and begins serving requests
+  </Step>
+</Steps>
+
+<Note>
+Boot times vary based on hardware. Physical systems with slower storage may take longer during the squashfs mount.
+</Note>
+
+## Debugging boot failures
+
+### Initramfs emergency shell
+
+If the initramfs cannot find `rootfs.squashfs`, it drops to an emergency shell:
+
+```bash
+# From scripts/initramfs-init:37-42
+if [ -z "$FOUND" ]; then
+    echo "verity-initramfs: FATAL — rootfs.squashfs not found on any device"
+    echo "verity-initramfs: available block devices:"
+    /bin/busybox ls -la /dev/sr* /dev/vd* /dev/sd* 2>/dev/null
+    /bin/busybox sh  # drop to emergency shell
+    exit 1
+fi
+```
+
+You can inspect `/dev/*` to diagnose why the boot media wasn't detected.
+
+### Missing /sbin/init
+
+If `/sbin/init` is missing from the squashfs:
+
+```bash
+# From scripts/initramfs-init:51-55
+if [ ! -x /newroot/sbin/init ]; then
+    echo "verity-initramfs: FATAL — /sbin/init not found in squashfs"
+    /bin/busybox sh
+    exit 1
+fi
+```
+
+This indicates a build failure. Rebuild the ISO.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Security model" icon="shield" href="/architecture/security-model">
+    Learn about kernel hardening and security measures
+  </Card>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    Return to the architecture overview
+  </Card>
+</CardGroup>

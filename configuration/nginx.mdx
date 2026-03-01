@@ -1,0 +1,197 @@
+---
+title: Nginx configuration
+description: Security-hardened nginx configuration with rate limiting and security headers
+---
+
+Verity's nginx configuration is designed for security and minimal attack surface. The web server runs as the only user-space process and enforces strict security policies.
+
+## Configuration file
+
+The complete nginx configuration is located at `config/nginx.conf`:
+
+```nginx config/nginx.conf
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+
+    # Hide nginx version
+    server_tokens off;
+
+    # Request limits
+    client_max_body_size 1m;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=global:10m rate=10r/s;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 256;
+
+    server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+
+        server_name _;
+        root /var/www/html;
+        index index.html;
+
+        # Security headers
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "0" always;
+        add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+        # Rate limiting
+        limit_req zone=global burst=20 nodelay;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        # Deny access to hidden files
+        location ~ /\. {
+            deny all;
+            access_log off;
+            log_not_found off;
+        }
+    }
+}
+```
+
+## Security headers
+
+<Accordion title="X-Frame-Options: DENY">
+  Prevents the page from being embedded in iframes, protecting against clickjacking attacks. Set to `DENY` to completely prohibit framing.
+  
+  ```nginx config/nginx.conf:51
+  add_header X-Frame-Options "DENY" always;
+  ```
+</Accordion>
+
+<Accordion title="X-Content-Type-Options: nosniff">
+  Prevents browsers from MIME-sniffing responses, forcing them to respect the declared Content-Type. This stops attackers from disguising malicious files as safe content types.
+  
+  ```nginx config/nginx.conf:52
+  add_header X-Content-Type-Options "nosniff" always;
+  ```
+</Accordion>
+
+<Accordion title="X-XSS-Protection: 0">
+  Disables the legacy XSS filter in older browsers. Modern browsers no longer use this filter, and it has been shown to introduce security vulnerabilities. The CSP header provides better protection.
+  
+  ```nginx config/nginx.conf:53
+  add_header X-XSS-Protection "0" always;
+  ```
+</Accordion>
+
+<Accordion title="Content-Security-Policy">
+  Defines which resources the browser is allowed to load. Verity uses an extremely restrictive policy:
+  
+  - `default-src 'none'` - Block all resources by default
+  - `style-src 'unsafe-inline'` - Allow inline styles only
+  - `img-src 'self'` - Allow images from same origin only
+  
+  ```nginx config/nginx.conf:54
+  add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'" always;
+  ```
+</Accordion>
+
+<Accordion title="Referrer-Policy">
+  Controls how much referrer information is sent with requests. `strict-origin-when-cross-origin` sends the full URL for same-origin requests but only the origin for cross-origin requests.
+  
+  ```nginx config/nginx.conf:55
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  ```
+</Accordion>
+
+<Accordion title="Permissions-Policy">
+  Disables browser features that could be abused for tracking or data collection. Camera, microphone, and geolocation are all disabled.
+  
+  ```nginx config/nginx.conf:56
+  add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+  ```
+</Accordion>
+
+## Rate limiting
+
+Verity implements rate limiting to prevent abuse and DoS attacks:
+
+```nginx config/nginx.conf:35
+limit_req_zone $binary_remote_addr zone=global:10m rate=10r/s;
+```
+
+This creates a shared memory zone of 10MB that tracks request rates by client IP address. The base rate is 10 requests per second.
+
+```nginx config/nginx.conf:59
+limit_req zone=global burst=20 nodelay;
+```
+
+The `burst=20` parameter allows temporary bursts of up to 20 requests above the rate limit, and `nodelay` processes burst requests immediately rather than queueing them.
+
+<Note>
+  Requests exceeding the rate limit will receive a 503 Service Unavailable response.
+</Note>
+
+## Request timeouts
+
+Strict timeouts prevent slowloris and similar attacks:
+
+```nginx config/nginx.conf:29-32
+client_max_body_size 1m;
+client_body_timeout 10s;
+client_header_timeout 10s;
+send_timeout 10s;
+```
+
+- **client_max_body_size**: Limits request body to 1MB
+- **client_body_timeout**: Client must send body within 10 seconds
+- **client_header_timeout**: Client must send headers within 10 seconds  
+- **send_timeout**: Response must be sent within 10 seconds
+
+## Hidden files protection
+
+Access to dotfiles is completely blocked:
+
+```nginx config/nginx.conf:66-70
+location ~ /\. {
+    deny all;
+    access_log off;
+    log_not_found off;
+}
+```
+
+This prevents access to `.git`, `.env`, `.htaccess`, and other sensitive configuration files.
+
+## Information disclosure
+
+```nginx config/nginx.conf:26
+server_tokens off;
+```
+
+The nginx version is hidden from response headers to prevent attackers from identifying known vulnerabilities in specific versions.

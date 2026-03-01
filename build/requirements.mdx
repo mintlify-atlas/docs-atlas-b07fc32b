@@ -1,0 +1,145 @@
+---
+title: Build requirements
+description: System requirements and tools needed to build Verity
+---
+
+Verity can be built natively on Linux or using Docker on macOS. The build process requires root access to create the chroot environment and package the squashfs filesystem.
+
+## Platform-specific requirements
+
+<Tabs>
+  <Tab title="Linux (native)">
+    Building natively on Linux provides the fastest build times and direct hardware access.
+
+    ### Required tools
+
+    The following utilities must be installed on your system:
+
+    - `bash` — build orchestration
+    - `wget` — download Alpine Linux rootfs
+    - `xorriso` — create bootable ISO
+    - `squashfs-tools` — create read-only root filesystem
+    - `cpio` — package initramfs
+    - `syslinux` — ISOLINUX bootloader
+
+    ### Root access
+
+    The build script must run as root to:
+    - Create and mount chroot environments
+    - Install packages via `apk` inside the chroot
+    - Create the squashfs filesystem
+
+    The `Makefile` automatically invokes `sudo` when running on Linux:
+
+    ```makefile
+    build:
+    ifeq ($(shell uname), Darwin)
+        @echo "macOS detected — building inside Docker"
+        docker run --rm --privileged \
+            --platform linux/amd64 \
+            -v "$(CURDIR)":/verity \
+            -w /verity \
+            alpine:3.21 \
+            sh -c "apk add --no-cache bash wget xorriso squashfs-tools cpio syslinux && bash scripts/build.sh"
+    else
+        sudo bash scripts/build.sh
+    endif
+    ```
+
+    From Makefile:6-15
+
+    ### Installing dependencies
+
+    <CodeGroup>
+    ```bash Ubuntu/Debian
+    sudo apt-get install bash wget xorriso squashfs-tools cpio syslinux isolinux
+    ```
+
+    ```bash Fedora/RHEL
+    sudo dnf install bash wget xorriso squashfs-tools cpio syslinux
+    ```
+
+    ```bash Arch Linux
+    sudo pacman -S bash wget libisoburn squashfs-tools cpio syslinux
+    ```
+    </CodeGroup>
+  </Tab>
+
+  <Tab title="macOS (Docker)">
+    macOS builds run inside an Alpine Linux container to provide a native Linux environment.
+
+    ### Required tools
+
+    - **Docker Desktop** or **OrbStack** — to run the build container
+    - `make` — build orchestration (pre-installed on macOS)
+
+    ### How it works
+
+    When you run `make build` on macOS, the Makefile:
+
+    1. Detects your platform using `uname`
+    2. Launches an `alpine:3.21` container with privileged access
+    3. Mounts your project directory into the container
+    4. Installs build dependencies inside the container
+    5. Runs `scripts/build.sh` in the containerized environment
+
+    From Makefile:6-15:
+
+    ```makefile
+    ifeq ($(shell uname), Darwin)
+        @echo "macOS detected — building inside Docker"
+        docker run --rm --privileged \
+            --platform linux/amd64 \
+            -v "$(CURDIR)":/verity \
+            -w /verity \
+            alpine:3.21 \
+            sh -c "apk add --no-cache bash wget xorriso squashfs-tools cpio syslinux && bash scripts/build.sh"
+    endif
+    ```
+
+    <Note>
+    The `--privileged` flag is required because the build script needs to create mount points and run `mksquashfs`.
+    </Note>
+
+    ### Installing Docker
+
+    - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (official)
+    - [OrbStack](https://orbstack.dev/) (lightweight alternative)
+  </Tab>
+</Tabs>
+
+## Testing requirements
+
+To test the ISO locally using QEMU:
+
+```bash
+sudo apt-get install qemu-system-x86  # Ubuntu/Debian
+brew install qemu                      # macOS
+```
+
+The test script verifies QEMU is available before launching:
+
+```bash
+command -v qemu-system-x86_64 >/dev/null || {
+    echo "qemu-system-x86_64 not found — install QEMU"
+    exit 1
+}
+```
+
+From scripts/test.sh:16-19
+
+## Build script validation
+
+The build script checks for required dependencies before starting:
+
+```bash
+[ "$EUID" -eq 0 ] || error "Must run as root"
+
+for cmd in wget xorriso mksquashfs cpio; do
+    command -v "$cmd" >/dev/null || error "Missing dependency: $cmd"
+done
+```
+
+From scripts/build.sh:38-42
+
+If any dependency is missing, the build will fail with a clear error message before attempting to download Alpine Linux or create the workspace.

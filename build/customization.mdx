@@ -1,0 +1,397 @@
+---
+title: Customizing Verity
+description: Customize web content, nginx configuration, and kernel hardening
+---
+
+Verity is designed to be customized before building the ISO. All customizations are baked into the read-only filesystem at build time.
+
+## Customizing web content
+
+Replace or add files to the `www/` directory before building.
+
+### Replace the default page
+
+The default landing page is `www/index.html`:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Verity</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            background: #0a0a0a;
+            color: #e5e5e5;
+        }
+        .container { text-align: center; }
+        h1 { font-size: 2rem; font-weight: 600; letter-spacing: -0.02em; }
+        p { margin-top: 0.5rem; color: #737373; font-size: 0.875rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Verity</h1>
+        <p>Serving static files. Replace www/ with your content.</p>
+    </div>
+</body>
+</html>
+```
+
+From www/index.html:1-30
+
+Replace this file with your own HTML:
+
+```bash
+cp my-site/index.html www/index.html
+make build
+```
+
+### Add a complete static site
+
+Copy an entire static site into `www/`:
+
+```bash
+rm -rf www/*
+cp -r my-site/dist/* www/
+make build
+```
+
+The build script copies everything in `www/` to `/var/www/html` in the ISO:
+
+```bash
+# Copy web content
+if [ -d "$PROJECT_DIR/www" ] && ls "$PROJECT_DIR/www/"* >/dev/null 2>&1; then
+    cp -r "$PROJECT_DIR/www/"* "$WORK_DIR/rootfs/var/www/html/"
+fi
+chroot "$WORK_DIR/rootfs" chown -R nginx:nginx /var/www/html
+```
+
+From scripts/build.sh:155-159
+
+<Note>
+All files are owned by the `nginx` user and served with the permissions set in `config/nginx.conf`.
+</Note>
+
+### Add subdirectories and assets
+
+You can add arbitrary directory structures:
+
+```bash
+www/
+  index.html
+  about.html
+  assets/
+    styles.css
+    logo.svg
+  docs/
+    guide.pdf
+```
+
+All paths are served relative to `/var/www/html`:
+
+```
+GET /              → www/index.html
+GET /about.html    → www/about.html
+GET /assets/logo.svg → www/assets/logo.svg
+```
+
+## Customizing nginx configuration
+
+Edit `config/nginx.conf` to change server behavior.
+
+### Current configuration
+
+The default config includes:
+- Security headers (CSP, X-Frame-Options, etc.)
+- Rate limiting (10 req/s per IP)
+- Gzip compression
+- Hidden nginx version
+
+```nginx
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log warn;
+pid /run/nginx/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # Hide nginx version
+    server_tokens off;
+
+    # Request limits
+    client_max_body_size 1m;
+    client_body_timeout 10s;
+    client_header_timeout 10s;
+    send_timeout 10s;
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=global:10m rate=10r/s;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 256;
+
+    server {
+        listen 80 default_server;
+        listen [::]:80 default_server;
+
+        server_name _;
+        root /var/www/html;
+        index index.html;
+
+        # Security headers
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "0" always;
+        add_header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+        # Rate limiting
+        limit_req zone=global burst=20 nodelay;
+
+        location / {
+            try_files $uri $uri/ =404;
+        }
+
+        # Deny access to hidden files
+        location ~ /\. {
+            deny all;
+            access_log off;
+            log_not_found off;
+        }
+    }
+}
+```
+
+From config/nginx.conf:1-73
+
+### Example: Adjust rate limiting
+
+To allow 100 requests per second instead of 10:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=global:10m rate=100r/s;
+```
+
+### Example: Enable directory listing
+
+To allow directory browsing:
+
+```nginx
+location / {
+    autoindex on;
+    autoindex_exact_size off;
+    autoindex_localtime on;
+}
+```
+
+### Example: Add custom MIME types
+
+To serve `.wasm` files with the correct content type:
+
+```nginx
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    types {
+        application/wasm wasm;
+    }
+    # ...
+}
+```
+
+### Example: Change the port
+
+To listen on port 8080 instead of 80:
+
+```nginx
+server {
+    listen 8080 default_server;
+    listen [::]:8080 default_server;
+    # ...
+}
+```
+
+<Warning>
+If you change the port, remember to update the QEMU port forwarding in `scripts/test.sh`:
+
+```bash
+-net user,hostfwd=tcp::8080-:8080
+```
+</Warning>
+
+## Customizing kernel hardening
+
+Edit `config/sysctl.conf` to adjust kernel security parameters.
+
+### Current hardening settings
+
+The default sysctl configuration:
+
+```conf
+# Verity — kernel hardening
+
+# Prevent kernel pointer leaks
+kernel.kptr_restrict = 2
+
+# Restrict access to kernel logs
+kernel.dmesg_restrict = 1
+
+# Disable kernel module loading after boot
+kernel.modules_disabled = 1
+
+# Restrict ptrace to admin only
+kernel.yama.ptrace_scope = 2
+
+# Disable kexec (prevents runtime kernel replacement)
+kernel.kexec_load_disabled = 1
+
+# Enable ASLR (full randomization)
+kernel.randomize_va_space = 2
+
+# Network hardening — reverse-path filtering (strict mode)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# Disable ICMP redirects (prevent MitM route injection)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Ignore ICMP ping requests
+net.ipv4.icmp_echo_ignore_all = 1
+
+# Enable SYN cookies for SYN flood protection
+net.ipv4.tcp_syncookies = 1
+
+# Disable IPv6
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+
+# File system hardening
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+
+# Restrict core dumps
+kernel.core_uses_pid = 1
+```
+
+From config/sysctl.conf:1-56
+
+These settings are applied during boot:
+
+```bash
+# Apply sysctl hardening
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+```
+
+From config/init:25-26
+
+### Example: Enable ICMP ping
+
+To allow ping responses:
+
+```conf
+net.ipv4.icmp_echo_ignore_all = 0
+```
+
+### Example: Enable IPv6
+
+To support IPv6:
+
+```conf
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+```
+
+And update `config/nginx.conf` to listen on IPv6:
+
+```nginx
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    # ...
+}
+```
+
+### Example: Allow kernel module loading
+
+<Warning>
+Disabling `kernel.modules_disabled` weakens the security model significantly.
+</Warning>
+
+To allow module loading after boot:
+
+```conf
+kernel.modules_disabled = 0
+```
+
+Note that the initramfs already loads all required modules before this setting is applied.
+
+## Applying customizations
+
+After modifying any of these files:
+
+```bash
+make build
+```
+
+All changes are baked into the new ISO. Test with:
+
+```bash
+make test
+curl http://localhost:8080
+```
+
+## Advanced: Adding custom init logic
+
+The `config/init` script is executed as PID 1. You can add custom logic before nginx starts:
+
+```bash
+#!/bin/sh
+
+# ... existing mount and network setup ...
+
+# Custom: Set up additional tmpfs mounts
+mount -t tmpfs -o size=10m tmpfs /var/cache
+
+# Custom: Create runtime directories
+mkdir -p /run/myapp
+
+# Apply sysctl hardening
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+
+echo "verity: starting nginx"
+exec nginx -g "daemon off;"
+```
+
+<Note>
+Anything added before `exec nginx` will delay the web server startup. Keep init logic minimal.
+</Note>

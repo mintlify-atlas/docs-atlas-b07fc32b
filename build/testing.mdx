@@ -1,0 +1,286 @@
+---
+title: Testing with QEMU
+description: Test your Verity ISO locally using QEMU virtualization
+---
+
+Verity includes a test script that boots the ISO in QEMU and forwards port 80 to `localhost:8080`.
+
+## Quick test
+
+```bash
+make test
+```
+
+This command:
+1. Verifies that `build/verity.iso` exists
+2. Checks that `qemu-system-x86_64` is installed
+3. Boots the ISO with port forwarding enabled
+
+## Test script behavior
+
+The test script (`scripts/test.sh`) performs pre-flight checks before launching QEMU:
+
+```bash
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ISO="$PROJECT_DIR/build/verity.iso"
+
+if [ ! -f "$ISO" ]; then
+    echo "ISO not found at $ISO — run 'make build' first"
+    exit 1
+fi
+
+command -v qemu-system-x86_64 >/dev/null || {
+    echo "qemu-system-x86_64 not found — install QEMU"
+    exit 1
+}
+```
+
+From scripts/test.sh:1-19
+
+<Note>
+If the ISO is missing, the script prompts you to run `make build` first.
+</Note>
+
+## QEMU configuration
+
+The ISO is launched with the following QEMU settings:
+
+```bash
+qemu-system-x86_64 \
+    -cdrom "$ISO" \
+    -m 512 \
+    -nographic \
+    -serial mon:stdio \
+    -net nic,model=e1000 \
+    -net user,hostfwd=tcp::8080-:80
+```
+
+From scripts/test.sh:26-32
+
+### Parameters explained
+
+| Parameter | Purpose |
+|-----------|----------|
+| `-cdrom "$ISO"` | Boot from the Verity ISO |
+| `-m 512` | Allocate 512 MB of RAM |
+| `-nographic` | Run without a graphical window |
+| `-serial mon:stdio` | Redirect serial output to terminal |
+| `-net nic,model=e1000` | Emulate an Intel e1000 network card |
+| `-net user,hostfwd=tcp::8080-:80` | Forward host port 8080 to guest port 80 |
+
+## Accessing the running instance
+
+Once QEMU boots, you'll see kernel messages in your terminal:
+
+```
+verity-initramfs: loading modules
+verity-initramfs: scanning for boot media
+verity-initramfs: found rootfs on /dev/sr0
+verity-initramfs: switching root
+verity: starting nginx
+```
+
+When you see `verity: starting nginx`, the web server is ready.
+
+### Test the server
+
+From another terminal:
+
+```bash
+curl http://localhost:8080
+```
+
+You should see the default landing page:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Verity</title>
+    ...
+</head>
+<body>
+    <div class="container">
+        <h1>Verity</h1>
+        <p>Serving static files. Replace www/ with your content.</p>
+    </div>
+</body>
+</html>
+```
+
+From www/index.html:1-30
+
+### Check response headers
+
+```bash
+curl -I http://localhost:8080
+```
+
+You should see security headers configured in `config/nginx.conf`:
+
+```
+HTTP/1.1 200 OK
+Server: nginx
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 0
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src 'self'
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Content-Type: text/html
+```
+
+## Stopping QEMU
+
+Press `Ctrl+C` in the terminal where QEMU is running to shut down the VM.
+
+## Boot sequence
+
+When the ISO boots, you'll see:
+
+<Steps>
+  <Step title="Initramfs loads modules">
+    The initramfs loads kernel modules required to access the boot media:
+
+    ```bash
+    # Load filesystem and block device modules
+    for mod in squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi; do
+        /bin/busybox modprobe "$mod" 2>/dev/null || true
+    done
+    ```
+
+    From scripts/initramfs-init:14-16
+  </Step>
+
+  <Step title="Scan for boot media">
+    The initramfs scans block devices to locate `rootfs.squashfs`:
+
+    ```bash
+    FOUND=""
+    for dev in /dev/sr0 /dev/vda /dev/vdb /dev/sda /dev/sdb; do
+        [ -b "$dev" ] || continue
+        /bin/busybox mkdir -p /tmp/mnt
+        if /bin/busybox mount -t iso9660 -o ro "$dev" /tmp/mnt 2>/dev/null; then
+            if [ -f /tmp/mnt/rootfs.squashfs ]; then
+                FOUND="$dev"
+                break
+            fi
+            /bin/busybox umount /tmp/mnt
+        fi
+    done
+    ```
+
+    From scripts/initramfs-init:24-35
+
+    In QEMU, the ISO is typically found at `/dev/sr0`.
+  </Step>
+
+  <Step title="Mount squashfs and switch root">
+    The squashfs is mounted via loop device and control is handed to the real init:
+
+    ```bash
+    /bin/busybox losetup /dev/loop0 /tmp/mnt/rootfs.squashfs
+    /bin/busybox mount -t squashfs -o ro /dev/loop0 /newroot
+
+    exec /bin/busybox switch_root /newroot /sbin/init
+    ```
+
+    From scripts/initramfs-init:48-64
+  </Step>
+
+  <Step title="Real init brings up networking">
+    The real init (`config/init`) mounts essential filesystems and brings up networking:
+
+    ```bash
+    # Mount essential filesystems
+    mount -t proc proc /proc
+    mount -t sysfs sys /sys
+    mount -t devtmpfs dev /dev
+
+    # Writable tmpfs mounts
+    mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /var/log
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+    mkdir -p /var/log/nginx /run/nginx
+
+    # Remount root as read-only
+    mount -o remount,ro /
+
+    # Networking
+    ip link set lo up
+    ip link set eth0 up 2>/dev/null
+    udhcpc -i eth0 -s /usr/share/udhcpc/default.script -b -q 2>/dev/null
+
+    # Apply sysctl hardening
+    sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+    ```
+
+    From config/init:6-26
+  </Step>
+
+  <Step title="Nginx becomes PID 1">
+    Finally, init `exec`s nginx, replacing itself:
+
+    ```bash
+    echo "verity: starting nginx"
+
+    # Exec replaces this process — nginx becomes PID 1
+    exec nginx -g "daemon off;"
+    ```
+
+    From config/init:28-31
+
+    At this point:
+    - There is no shell or login prompt
+    - No other processes are running
+    - The root filesystem is read-only
+    - Kernel hardening (sysctl) is active
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### QEMU not found
+
+If you see:
+
+```
+qemu-system-x86_64 not found — install QEMU
+```
+
+Install QEMU:
+
+```bash
+sudo apt-get install qemu-system-x86  # Ubuntu/Debian
+brew install qemu                      # macOS
+```
+
+### ISO not found
+
+If you see:
+
+```
+ISO not found at build/verity.iso — run 'make build' first
+```
+
+Build the ISO:
+
+```bash
+make build
+```
+
+### Port 8080 already in use
+
+If port 8080 is already bound, edit `scripts/test.sh` and change the port forwarding:
+
+```bash
+-net user,hostfwd=tcp::9090-:80  # Use port 9090 instead
+```
+
+Then access the server at `http://localhost:9090`.

@@ -1,0 +1,282 @@
+---
+title: Initramfs init reference
+description: Reference for the custom initramfs init script that loads modules, finds boot media, and mounts the squashfs root
+---
+
+The `scripts/initramfs-init` script is the first userspace process that runs during boot. It's responsible for:
+
+1. Mounting essential filesystems
+2. Loading kernel modules
+3. Scanning for boot media containing the squashfs
+4. Mounting the squashfs root filesystem
+5. Switching to the real root and executing `/sbin/init`
+
+## Overview
+
+This init script is embedded in the initramfs (at `/init`) and runs before the real root filesystem is available. It's kept minimal and uses only busybox applets.
+
+```sh scripts/initramfs-init
+#!/bin/sh
+
+# Verity — initramfs init
+# Loads modules, finds boot media, mounts squashfs, pivot-roots into the real system.
+```
+
+<Note>
+The entire script is POSIX shell (`/bin/sh`) and depends only on busybox, which is statically linked into the initramfs.
+</Note>
+
+## Filesystem setup
+
+### Mount pseudo-filesystems
+
+Before any other operations, the script mounts essential pseudo-filesystems:
+
+```sh scripts/initramfs-init
+/bin/busybox mkdir -p /proc /sys /dev /tmp /newroot
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sys /sys
+/bin/busybox mount -t devtmpfs dev /dev
+```
+
+**Why these are needed:**
+
+<Accordion title="/proc - Process information">
+`/proc` provides kernel and process information. Required by `modprobe` to load kernel modules.
+</Accordion>
+
+<Accordion title="/sys - Device information">
+`/sys` exposes device and driver information. Needed for hardware detection and module loading.
+</Accordion>
+
+<Accordion title="/dev - Device nodes">
+`devtmpfs` automatically creates device nodes for all hardware. Required to access block devices like `/dev/sr0` and `/dev/vda`.
+</Accordion>
+
+<Accordion title="/newroot - Mount point for real root">
+The squashfs will be mounted here before switching root.
+</Accordion>
+
+## Module loading
+
+The script loads kernel modules needed to access the boot media and root filesystem:
+
+```sh scripts/initramfs-init
+echo "verity-initramfs: loading modules"
+
+# Load filesystem and block device modules
+for mod in squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi; do
+    /bin/busybox modprobe "$mod" 2>/dev/null || true
+done
+
+# Wait briefly for device nodes to settle
+/bin/busybox sleep 1
+```
+
+### Module descriptions
+
+| Module | Purpose |
+|--------|----------|
+| `squashfs` | Read-only compressed filesystem support |
+| `loop` | Loopback block device (mount files as block devices) |
+| `isofs` | ISO9660 CD-ROM filesystem |
+| `sr_mod` | SCSI CD-ROM driver |
+| `cdrom` | Generic CD-ROM driver |
+| `virtio_blk` | VirtIO block device (QEMU/KVM) |
+| `virtio_pci` | VirtIO PCI transport |
+| `virtio_scsi` | VirtIO SCSI driver |
+
+<Note>
+The `|| true` ensures the script continues even if a module is already built into the kernel or fails to load (e.g., virtio modules on bare metal).
+</Note>
+
+## Boot media scanning
+
+The script scans common block devices to find the ISO containing `rootfs.squashfs`:
+
+```sh scripts/initramfs-init
+echo "verity-initramfs: scanning for boot media"
+
+# Scan block devices for our squashfs
+FOUND=""
+for dev in /dev/sr0 /dev/vda /dev/vdb /dev/sda /dev/sdb; do
+    [ -b "$dev" ] || continue
+    /bin/busybox mkdir -p /tmp/mnt
+    if /bin/busybox mount -t iso9660 -o ro "$dev" /tmp/mnt 2>/dev/null; then
+        if [ -f /tmp/mnt/rootfs.squashfs ]; then
+            FOUND="$dev"
+            break
+        fi
+        /bin/busybox umount /tmp/mnt
+    fi
+done
+```
+
+### Device scan order
+
+Devices are checked in this order:
+
+1. `/dev/sr0` — First CD-ROM drive (typical for ISO boot)
+2. `/dev/vda`, `/dev/vdb` — VirtIO disk drives (QEMU/KVM)
+3. `/dev/sda`, `/dev/sdb` — SATA/SCSI drives (bare metal)
+
+<Accordion title="Why this specific order?">
+This ordering prioritizes the most common boot scenarios:
+- CD-ROM boot (physical or virtual)
+- VirtIO (cloud/VM environments)
+- Legacy SCSI/SATA (bare metal servers)
+</Accordion>
+
+### Error handling
+
+If no device contains the squashfs, the script drops to an emergency shell:
+
+```sh scripts/initramfs-init
+if [ -z "$FOUND" ]; then
+    echo "verity-initramfs: FATAL — rootfs.squashfs not found on any device"
+    echo "verity-initramfs: available block devices:"
+    /bin/busybox ls -la /dev/sr* /dev/vd* /dev/sd* 2>/dev/null
+    /bin/busybox sh  # drop to emergency shell
+    exit 1
+fi
+
+echo "verity-initramfs: found rootfs on $FOUND"
+```
+
+<Warning>
+If you see the emergency shell, the boot media wasn't detected. Check that:
+- The ISO is properly attached
+- Required kernel modules loaded successfully
+- The ISO actually contains `rootfs.squashfs`
+</Warning>
+
+## Mounting the squashfs
+
+Once the boot media is found, the script mounts the squashfs using a loop device:
+
+```sh scripts/initramfs-init
+# Mount the squashfs
+/bin/busybox losetup /dev/loop0 /tmp/mnt/rootfs.squashfs
+/bin/busybox mount -t squashfs -o ro /dev/loop0 /newroot
+```
+
+**Why use a loop device?**
+
+The squashfs file is inside the ISO filesystem. We can't mount it directly, so we:
+1. Mount the ISO (already done in scanning phase)
+2. Attach the squashfs file to a loop device
+3. Mount the loop device as the root filesystem
+
+### Verification
+
+Before switching root, the script verifies that `/sbin/init` exists:
+
+```sh scripts/initramfs-init
+if [ ! -x /newroot/sbin/init ]; then
+    echo "verity-initramfs: FATAL — /sbin/init not found in squashfs"
+    /bin/busybox sh
+    exit 1
+fi
+```
+
+## Switching to real root
+
+Finally, the script cleans up initramfs mounts and switches to the real root:
+
+```sh scripts/initramfs-init
+echo "verity-initramfs: switching root"
+
+# Clean up initramfs mounts
+/bin/busybox umount /proc
+/bin/busybox umount /sys
+/bin/busybox umount /dev
+
+exec /bin/busybox switch_root /newroot /sbin/init
+```
+
+### What is switch_root?
+
+`switch_root` performs an atomic switch from the initramfs to the real root filesystem:
+
+1. Moves `/newroot` to `/`
+2. Deletes the initramfs from memory
+3. Chroots into the new root
+4. Execs `/sbin/init` (which becomes PID 1)
+
+<Note>
+After `switch_root`, the initramfs is completely gone. The system is now running from the read-only squashfs.
+</Note>
+
+## Execution flow diagram
+
+```
+BIOS/UEFI
+    ↓
+ISOLINUX loads kernel + initramfs
+    ↓
+Kernel decompresses initramfs into RAM
+    ↓
+Kernel runs /init (this script)
+    ↓
+Mount /proc, /sys, /dev
+    ↓
+Load kernel modules (squashfs, loop, isofs, virtio, etc.)
+    ↓
+Scan block devices (/dev/sr0, /dev/vda, /dev/sda, ...)
+    ↓
+Mount ISO filesystem → find rootfs.squashfs
+    ↓
+Attach squashfs to loop device → mount as /newroot
+    ↓
+Unmount initramfs filesystems
+    ↓
+switch_root /newroot /sbin/init
+    ↓
+Real system init takes over (config/init)
+```
+
+## Debugging
+
+If the system drops to an emergency shell, you can manually inspect the environment:
+
+```bash
+# List available block devices
+ls -la /dev/sr* /dev/vd* /dev/sd*
+
+# Check loaded modules
+cat /proc/modules
+
+# Try mounting manually
+mount -t iso9660 /dev/sr0 /tmp/mnt
+ls /tmp/mnt
+
+# Check if squashfs exists
+ls -lh /tmp/mnt/rootfs.squashfs
+
+# Mount squashfs manually
+losetup /dev/loop0 /tmp/mnt/rootfs.squashfs
+mount -t squashfs /dev/loop0 /newroot
+ls /newroot
+```
+
+## Customization
+
+You can modify the init script to:
+
+- Add additional kernel modules
+- Change device scan order
+- Add network drivers for PXE boot
+- Enable serial console logging
+- Support encrypted squashfs (with cryptsetup)
+
+Example - add e1000 network driver:
+
+```sh
+for mod in squashfs loop isofs sr_mod cdrom virtio_blk virtio_pci virtio_scsi e1000; do
+    /bin/busybox modprobe "$mod" 2>/dev/null || true
+done
+```
+
+<Warning>
+If you modify this script, you must rebuild the ISO. The initramfs is baked into the ISO during the build process.
+</Warning>

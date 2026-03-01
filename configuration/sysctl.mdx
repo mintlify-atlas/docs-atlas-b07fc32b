@@ -1,0 +1,243 @@
+---
+title: Kernel hardening via sysctl
+description: Comprehensive kernel security settings applied at boot time
+---
+
+Verity applies extensive kernel hardening through sysctl parameters defined in `config/sysctl.conf`. These settings are loaded during the init process and enforce security policies at the kernel level.
+
+## Configuration file
+
+```conf config/sysctl.conf
+# Verity — kernel hardening
+
+# Prevent kernel pointer leaks
+kernel.kptr_restrict = 2
+
+# Restrict access to kernel logs
+kernel.dmesg_restrict = 1
+
+# Disable kernel module loading after boot
+kernel.modules_disabled = 1
+
+# Restrict ptrace to admin only
+kernel.yama.ptrace_scope = 2
+
+# Disable kexec (prevents runtime kernel replacement)
+kernel.kexec_load_disabled = 1
+
+# Enable ASLR (full randomization)
+kernel.randomize_va_space = 2
+
+# Network hardening — reverse-path filtering (strict mode)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# Disable ICMP redirects (prevent MitM route injection)
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+
+# Ignore ICMP ping requests
+net.ipv4.icmp_echo_ignore_all = 1
+
+# Enable SYN cookies for SYN flood protection
+net.ipv4.tcp_syncookies = 1
+
+# Disable IPv6
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+
+# File system hardening
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.suid_dumpable = 0
+
+# Restrict core dumps
+kernel.core_uses_pid = 1
+```
+
+## Kernel hardening
+
+### Kernel pointer restriction
+
+```conf config/sysctl.conf:4
+kernel.kptr_restrict = 2
+```
+
+Prevents kernel pointer addresses from being exposed to user-space, even to root. This makes it significantly harder for attackers to exploit kernel vulnerabilities by hiding memory layout information.
+
+<Note>
+  Setting `kptr_restrict = 2` hides kernel pointers from all users, including root.
+</Note>
+
+### Kernel log restriction
+
+```conf config/sysctl.conf:7
+kernel.dmesg_restrict = 1
+```
+
+Restricts access to kernel ring buffer messages via `dmesg` to privileged users only. Kernel logs often contain sensitive information about hardware, memory addresses, and system internals.
+
+### Module loading disabled
+
+```conf config/sysctl.conf:10
+kernel.modules_disabled = 1
+```
+
+Disables loading of kernel modules after boot completes. This is irreversible without a reboot and prevents attackers from loading malicious kernel modules.
+
+<Warning>
+  This setting is applied after the init system loads all necessary modules. Once set, no new modules can be loaded until reboot.
+</Warning>
+
+### Ptrace restrictions
+
+```conf config/sysctl.conf:13
+kernel.yama.ptrace_scope = 2
+```
+
+Restricts ptrace to admin-only (CAP_SYS_PTRACE). This prevents processes from debugging or inspecting other processes, even those owned by the same user.
+
+- `0` - No restrictions (default)
+- `1` - Restricted to parent processes only
+- `2` - Admin only (CAP_SYS_PTRACE required)
+- `3` - No processes may ptrace
+
+### Kexec disabled
+
+```conf config/sysctl.conf:16
+kernel.kexec_load_disabled = 1
+```
+
+Disables kexec, which allows loading a new kernel from the running kernel. This prevents attackers from replacing the kernel at runtime.
+
+### ASLR enabled
+
+```conf config/sysctl.conf:19
+kernel.randomize_va_space = 2
+```
+
+Enables full Address Space Layout Randomization (ASLR), randomizing the positions of:
+- Stack
+- VDSO page
+- Shared memory regions
+- Data segments
+- Heap
+
+This makes exploitation significantly more difficult by making memory addresses unpredictable.
+
+## Network hardening
+
+### Reverse path filtering
+
+```conf config/sysctl.conf:22-23
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+```
+
+Enables strict reverse path filtering. The kernel verifies that packets arrive on the interface they would be routed out of. This prevents IP spoofing attacks.
+
+### Source routing disabled
+
+```conf config/sysctl.conf:26-27
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+```
+
+Disables source-routed packets, which allow the sender to specify the route packets take through the network. This is almost never used legitimately and can be abused for attacks.
+
+### ICMP redirects disabled
+
+```conf config/sysctl.conf:30-37
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+```
+
+Disables both accepting and sending ICMP redirect messages for IPv4 and IPv6. ICMP redirects can be used for man-in-the-middle attacks to redirect traffic through an attacker's system.
+
+### ICMP echo disabled
+
+```conf config/sysctl.conf:40
+net.ipv4.icmp_echo_ignore_all = 1
+```
+
+Ignores all ICMP echo (ping) requests. This makes the system invisible to ping sweeps and prevents information disclosure about system availability.
+
+### SYN cookies enabled
+
+```conf config/sysctl.conf:43
+net.ipv4.tcp_syncookies = 1
+```
+
+Enables SYN cookies to protect against SYN flood attacks. When the SYN queue is full, the kernel uses cryptographic cookies instead of allocating connection resources.
+
+### IPv6 disabled
+
+```conf config/sysctl.conf:46-47
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+```
+
+Completely disables IPv6 stack. Since Verity only serves IPv4 traffic, IPv6 is disabled to reduce attack surface.
+
+<Note>
+  Disabling IPv6 prevents entire classes of IPv6-based attacks and reduces the kernel's network code exposure.
+</Note>
+
+## Filesystem hardening
+
+### Protected hardlinks and symlinks
+
+```conf config/sysctl.conf:50-51
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+```
+
+Prevents users from creating hardlinks or symlinks to files they don't own. This closes privilege escalation vulnerabilities where attackers trick privileged processes into operating on different files.
+
+**Protected hardlinks**: Users can only create hardlinks to files they can read and write.
+
+**Protected symlinks**: Symlinks in world-writable directories can only be followed if:
+- The symlink and its target are owned by the same user
+- The directory owner matches the symlink owner
+
+### SUID core dumps disabled
+
+```conf config/sysctl.conf:52
+fs.suid_dumpable = 0
+```
+
+Disables core dumps for setuid programs. Core dumps can contain sensitive information like passwords or cryptographic keys that existed in memory.
+
+### Core dump naming
+
+```conf config/sysctl.conf:55
+kernel.core_uses_pid = 1
+```
+
+Appends the PID to core dump filenames, preventing multiple crashes from overwriting each other's core dumps.
+
+## Application during boot
+
+These settings are applied by the init system:
+
+```sh config/init:26
+sysctl -p /etc/sysctl.conf >/dev/null 2>&1 || true
+```
+
+The `|| true` ensures boot continues even if some sysctl parameters fail to apply (e.g., if a kernel was compiled without certain features).

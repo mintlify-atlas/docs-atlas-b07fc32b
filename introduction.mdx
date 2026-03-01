@@ -1,0 +1,120 @@
+---
+title: Introduction
+description: A sovereign, hardened Alpine Linux ISO that boots directly into nginx with a read-only root filesystem
+---
+
+# Verity
+
+A sovereign, hardened Alpine Linux ISO that boots directly into nginx. No shell, no package manager, no SSH — just a static file server on a read-only root filesystem.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build and test Verity in minutes
+  </Card>
+  <Card title="Architecture" icon="building" href="/architecture/overview">
+    Understand how Verity works
+  </Card>
+  <Card title="Build & Deploy" icon="hammer" href="/build/building">
+    Create your own ISO
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration/nginx">
+    Customize your setup
+  </Card>
+</CardGroup>
+
+## What is sovereignty?
+
+Most servers are held together by trust in things you don't control — upstream repos, package managers, update daemons, shell access that "probably nobody will use." Every one of those is an assumption, and every assumption is a surface.
+
+**Sovereignty means your server runs exactly what you built, nothing more.**
+
+Verity achieves this by eliminating every component that isn't strictly necessary to serve files:
+
+<CardGroup cols={2}>
+  <Card title="No package manager" icon="ban">
+    apk is deleted after build. Nothing can be installed at runtime.
+  </Card>
+  <Card title="No shell" icon="terminal">
+    No way to get an interactive session. No SSH, no TTY, no login.
+  </Card>
+  <Card title="No mutation" icon="lock">
+    Root filesystem is squashfs — read-only by nature, not by policy. No `remount,rw`.
+  </Card>
+  <Card title="No ambient authority" icon="shield">
+    Kernel module loading disabled after boot. ptrace restricted. kexec off.
+  </Card>
+</CardGroup>
+
+## The result
+
+A machine that does one thing, can't be told to do anything else, and can be fully understood by one person.
+
+The entire system is **~400 lines of shell** across a handful of files. You can read all of it in one sitting.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Read-only root" icon="lock">
+    Squashfs filesystem prevents any runtime modification
+  </Card>
+  <Card title="Minimal attack surface" icon="shield">
+    No shells, package managers, or debugging tools
+  </Card>
+  <Card title="Kernel hardening" icon="shield-halved">
+    Comprehensive sysctl configuration for security
+  </Card>
+  <Card title="Secure by default" icon="lock">
+    Security headers, rate limiting, and hidden server version
+  </Card>
+  <Card title="Tiny footprint" icon="feather">
+    ISO size: 50-100 MB, ~400 lines of code
+  </Card>
+  <Card title="Fully auditable" icon="magnifying-glass">
+    Small enough to understand completely
+  </Card>
+</CardGroup>
+
+## What Verity does
+
+Verity builds a bootable ISO that:
+
+- Boots via ISOLINUX into a custom initramfs
+- Mounts a squashfs root filesystem (read-only)
+- Brings up networking via DHCP
+- Applies kernel hardening (sysctl)
+- Runs nginx as PID 1 — nothing else
+
+<Note>
+The ISO is typically 50-100 MB and boots in seconds. nginx becomes PID 1, meaning if nginx stops, the system halts.
+</Note>
+
+## Use cases
+
+Verity is designed for scenarios where you need:
+
+- **Static file hosting** with maximum security
+- **Immutable infrastructure** that can't be modified at runtime
+- **Minimal attack surface** for internet-facing servers
+- **Fully auditable systems** where you can verify every line of code
+- **Sovereign servers** that run only what you built
+
+<Warning>
+Verity is not designed for general-purpose computing. It has no package manager, no shell, and no way to install software at runtime. If you need to change anything, rebuild the ISO.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Build your first ISO" icon="rocket" href="/quickstart">
+    Follow the quickstart guide
+  </Card>
+  <Card title="Understand the architecture" icon="sitemap" href="/architecture/overview">
+    Learn how Verity works
+  </Card>
+  <Card title="Customize your setup" icon="wrench" href="/build/customization">
+    Add your own content
+  </Card>
+  <Card title="Review security model" icon="shield" href="/architecture/security-model">
+    Understand the hardening
+  </Card>
+</CardGroup>

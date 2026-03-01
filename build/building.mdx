@@ -1,0 +1,274 @@
+---
+title: Building the ISO
+description: Step-by-step guide to building a Verity ISO image
+---
+
+The build process creates a minimal, hardened Alpine Linux ISO (~50-100 MB) that boots directly into nginx.
+
+## Quick build
+
+```bash
+make build
+```
+
+This command detects your platform and automatically uses either native Linux or Docker-based builds.
+
+## Build process overview
+
+<Steps>
+  <Step title="Environment setup">
+    The build script creates a temporary workspace and validates dependencies:
+
+    ```bash
+    log "Setting up workspace"
+    rm -rf "$WORK_DIR"
+    mkdir -p "$WORK_DIR"/{rootfs,iso/boot/isolinux,initramfs/{bin,dev,proc,sys,tmp,newroot,lib/modules}}
+    mkdir -p "$OUTPUT_DIR"
+    ```
+
+    From scripts/build.sh:46-49
+
+    The workspace is created in `/tmp/verity-build` and includes:
+    - `rootfs/` — Alpine Linux root filesystem (will become squashfs)
+    - `iso/` — ISO staging area
+    - `initramfs/` — temporary root filesystem used during boot
+  </Step>
+
+  <Step title="Download Alpine Linux">
+    Downloads the Alpine Linux 3.21 minirootfs and verifies the SHA256 checksum:
+
+    ```bash
+    ALPINE_VERSION="3.21"
+    ALPINE_RELEASE="${ALPINE_VERSION}.0"
+    ALPINE_ARCH="x86_64"
+    ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}"
+
+    ROOTFS_TAR="alpine-minirootfs-${ALPINE_RELEASE}-${ALPINE_ARCH}.tar.gz"
+    ROOTFS_URL="${ALPINE_MIRROR}/releases/${ALPINE_ARCH}/${ROOTFS_TAR}"
+    SHA256_URL="${ALPINE_MIRROR}/releases/${ALPINE_ARCH}/${ROOTFS_TAR}.sha256"
+
+    log "Downloading Alpine ${ALPINE_RELEASE}"
+    wget -q "$ROOTFS_URL"    || error "Failed to download rootfs"
+    wget -q "$SHA256_URL"     || error "Failed to download checksum"
+    sha256sum -c "${ROOTFS_TAR}.sha256" || error "Checksum verification failed"
+    ```
+
+    From scripts/build.sh:53-63
+
+    <Note>
+    The downloaded rootfs is cached in `/tmp/verity-build` — subsequent builds reuse the same tarball.
+    </Note>
+  </Step>
+
+  <Step title="Install packages">
+    Mounts the rootfs and installs required packages inside a chroot:
+
+    ```bash
+    log "Installing packages"
+    chroot "$WORK_DIR/rootfs" /bin/sh <<'CHROOT_EOF'
+    set -e
+    apk update
+    apk add --no-cache \
+        nginx \
+        linux-lts \
+        busybox-static \
+        tzdata \
+        ca-certificates
+    adduser -D -H -s /sbin/nologin nginx 2>/dev/null || true
+    mkdir -p /var/www/html /var/log/nginx /run/nginx
+    chown -R nginx:nginx /var/www/html /var/log/nginx /run/nginx
+    CHROOT_EOF
+    ```
+
+    From scripts/build.sh:78-91
+
+    The installed packages:
+    - `nginx` — the web server (becomes PID 1)
+    - `linux-lts` — kernel and modules
+    - `busybox-static` — used by initramfs
+    - `tzdata`, `ca-certificates` — system utilities
+  </Step>
+
+  <Step title="Build initramfs">
+    Creates a minimal initramfs that locates the boot media and mounts the squashfs root:
+
+    ```bash
+    log "Building initramfs"
+
+    # Copy kernel
+    VMLINUZ=$(ls "$WORK_DIR/rootfs/boot"/vmlinuz-lts 2>/dev/null) \
+        || error "vmlinuz-lts not found — linux-lts failed to install"
+    cp "$VMLINUZ" "$WORK_DIR/iso/boot/vmlinuz"
+
+    # Copy busybox-static
+    cp "$WORK_DIR/rootfs/bin/busybox.static" "$WORK_DIR/initramfs/bin/busybox"
+
+    # Symlink busybox applets needed by initramfs-init
+    INITRAMFS="$WORK_DIR/initramfs"
+    for applet in sh mount umount mkdir sleep ls modprobe losetup switch_root; do
+        ln -sf busybox "$INITRAMFS/bin/$applet"
+    done
+    ```
+
+    From scripts/build.sh:96-110
+
+    The initramfs includes:
+    - Busybox and essential applets
+    - Kernel modules (squashfs, loop, isofs, sr_mod, virtio drivers)
+    - Custom init script (`scripts/initramfs-init`)
+
+    <Warning>
+    The initramfs must be built **before** the hardening step, which removes `/boot` and `/lib/modules` from the rootfs.
+    </Warning>
+  </Step>
+
+  <Step title="Copy configurations">
+    Installs custom configs and web content:
+
+    ```bash
+    log "Copying configs"
+    cp "$PROJECT_DIR/config/nginx.conf"  "$WORK_DIR/rootfs/etc/nginx/nginx.conf"
+    cp "$PROJECT_DIR/config/sysctl.conf" "$WORK_DIR/rootfs/etc/sysctl.conf"
+    cp "$PROJECT_DIR/config/init"        "$WORK_DIR/rootfs/sbin/init"
+    chmod +x "$WORK_DIR/rootfs/sbin/init"
+
+    # Copy web content
+    if [ -d "$PROJECT_DIR/www" ] && ls "$PROJECT_DIR/www/"* >/dev/null 2>&1; then
+        cp -r "$PROJECT_DIR/www/"* "$WORK_DIR/rootfs/var/www/html/"
+    fi
+    chroot "$WORK_DIR/rootfs" chown -R nginx:nginx /var/www/html
+    ```
+
+    From scripts/build.sh:148-159
+  </Step>
+
+  <Step title="Harden the system">
+    Removes all non-essential tools to minimize the attack surface:
+
+    ```bash
+    log "Hardening system"
+    chroot "$WORK_DIR/rootfs" /bin/sh <<'CHROOT_EOF'
+    set -e
+
+    # Remove package manager
+    rm -f /sbin/apk /usr/bin/apk
+
+    # Remove kernel source + modules (already extracted to initramfs)
+    rm -rf /boot /lib/modules
+
+    # Remove unnecessary tools
+    rm -f /usr/bin/wget /usr/bin/curl /usr/bin/vi /usr/bin/nano
+    rm -f /usr/bin/strace /usr/bin/gdb
+
+    # Remove docs
+    rm -rf /usr/share/man /usr/share/doc
+
+    # Clear caches
+    rm -rf /var/cache/apk/* /tmp/*
+    CHROOT_EOF
+    ```
+
+    From scripts/build.sh:163-181
+
+    This step:
+    - Deletes `apk` (no package installation at runtime)
+    - Removes `/boot` and kernel modules (already in initramfs)
+    - Strips out shells, editors, and debugging tools
+    - Clears package caches
+  </Step>
+
+  <Step title="Create squashfs">
+    Packages the hardened rootfs as a read-only squashfs filesystem:
+
+    ```bash
+    log "Creating squashfs"
+    mksquashfs "$WORK_DIR/rootfs" "$WORK_DIR/iso/rootfs.squashfs" \
+        -comp xz -noappend -quiet
+    [ -f "$WORK_DIR/iso/rootfs.squashfs" ] || error "squashfs creation failed"
+    ```
+
+    From scripts/build.sh:194-197
+
+    The squashfs is compressed with `xz` for maximum space efficiency. This filesystem is inherently read-only — there is no way to remount it as writable.
+  </Step>
+
+  <Step title="Configure bootloader">
+    Sets up ISOLINUX to boot the kernel and initramfs:
+
+    ```bash
+    log "Setting up ISOLINUX"
+
+    cat > "$WORK_DIR/iso/boot/isolinux/isolinux.cfg" <<'EOF'
+    DEFAULT verity
+    LABEL verity
+        LINUX /boot/vmlinuz
+        INITRD /boot/initramfs.gz
+        APPEND quiet
+    EOF
+    ```
+
+    From scripts/build.sh:203-209
+
+    The bootloader configuration:
+    - Loads the kernel (`vmlinuz`)
+    - Loads the initramfs (`initramfs.gz`)
+    - Passes `quiet` to suppress verbose kernel output
+  </Step>
+
+  <Step title="Generate ISO">
+    Creates the final bootable ISO using `xorriso`:
+
+    ```bash
+    log "Creating ISO"
+    xorriso -as mkisofs \
+        -o "$OUTPUT_DIR/$ISO_NAME" \
+        -V "VERITY" \
+        -c boot/isolinux/boot.cat \
+        -b boot/isolinux/isolinux.bin \
+        -no-emul-boot \
+        -boot-load-size 4 \
+        -boot-info-table \
+        "$WORK_DIR/iso/"
+
+    [ -f "$OUTPUT_DIR/$ISO_NAME" ] || error "ISO creation failed"
+    ```
+
+    From scripts/build.sh:232-242
+
+    The ISO is written to `build/verity.iso` and includes:
+    - Bootable ISOLINUX loader
+    - Kernel and initramfs in `/boot`
+    - `rootfs.squashfs` at the root
+  </Step>
+</Steps>
+
+## Build output
+
+After a successful build:
+
+```bash
+[verity] Build complete!
+
+  ISO: /path/to/verity/build/verity.iso
+  Size: 67M
+
+  Test: make test
+```
+
+From scripts/build.sh:247-253
+
+## Rebuild behavior
+
+Running `make build` again:
+- Removes the previous `build/` directory
+- Reuses the cached Alpine rootfs in `/tmp/verity-build` (if present)
+- Regenerates the entire ISO from scratch
+
+To force a clean build:
+
+```bash
+make clean
+make build
+```
+
+This removes `build/` but does not clear the `/tmp/verity-build` cache.

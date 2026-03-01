@@ -1,0 +1,170 @@
+---
+title: Architecture overview
+description: Understanding Verity's minimal, sovereign system architecture
+---
+
+Verity is a hardened Alpine Linux ISO that boots directly into nginx. The entire system is designed around a single principle: run exactly what you built, nothing more.
+
+## Design philosophy
+
+Most servers are held together by trust in things you don't control — upstream repos, package managers, update daemons, shell access that "probably nobody will use." Every one of those is an assumption, and every assumption is a surface.
+
+Sovereignty means your server runs exactly what you built, nothing more. Verity achieves this by eliminating every component that isn't strictly necessary to serve files.
+
+## Core components
+
+The entire system consists of only three essential components:
+
+<Steps>
+  <Step title="Linux kernel">
+    A hardened LTS kernel from Alpine Linux with minimal modules loaded only during boot.
+  </Step>
+  
+  <Step title="Squashfs root filesystem">
+    A compressed, read-only root filesystem that cannot be modified at runtime — not by policy, but by nature.
+  </Step>
+  
+  <Step title="nginx as PID 1">
+    nginx runs as the only process on the system, serving static files with security headers and rate limiting.
+  </Step>
+</Steps>
+
+## What's excluded
+
+Verity achieves sovereignty through strategic omissions:
+
+### No package manager
+
+```bash
+# From scripts/build.sh:166-167
+# Remove package manager
+rm -f /sbin/apk /usr/bin/apk
+```
+
+apk is deleted after the build completes. Nothing can be installed at runtime.
+
+### No shell access
+
+There is no way to get an interactive session:
+- No SSH daemon
+- No TTY login
+- No shell binaries in the final system (only busybox in initramfs)
+
+```bash
+# From scripts/build.sh:172-174
+# Remove unnecessary tools
+rm -f /usr/bin/wget /usr/bin/curl /usr/bin/vi /usr/bin/nano
+rm -f /usr/bin/strace /usr/bin/gdb
+```
+
+### No runtime mutation
+
+The root filesystem is squashfs — read-only by nature, not by policy:
+
+```bash
+# From scripts/build.sh:194-196
+log "Creating squashfs"
+mksquashfs "$WORK_DIR/rootfs" "$WORK_DIR/iso/rootfs.squashfs" \
+    -comp xz -noappend -quiet
+```
+
+There is no `remount,rw`. The filesystem format itself prevents modification.
+
+<Note>
+While the root filesystem is read-only, `/tmp`, `/var/log`, and `/run` are mounted as writable tmpfs filesystems to allow nginx to function. These exist only in RAM and are cleared on reboot.
+</Note>
+
+### No ambient authority
+
+Kernel module loading is disabled after boot:
+
+```bash
+# From config/sysctl.conf:9-10
+# Disable kernel module loading after boot
+kernel.modules_disabled = 1
+```
+
+ptrace is restricted to prevent process inspection:
+
+```bash
+# From config/sysctl.conf:12-13
+# Restrict ptrace to admin only
+kernel.yama.ptrace_scope = 2
+```
+
+kexec is disabled to prevent runtime kernel replacement:
+
+```bash
+# From config/sysctl.conf:15-16
+# Disable kexec (prevents runtime kernel replacement)
+kernel.kexec_load_disabled = 1
+```
+
+## System size
+
+The entire system is approximately 50-100 MB, containing:
+
+- Linux kernel (~10-15 MB)
+- nginx and minimal dependencies (~5 MB)
+- busybox and core utilities (~2 MB)
+- SSL certificates and timezone data (~5 MB)
+- Your static web content (variable)
+
+The entire codebase is ~400 lines of shell across a handful of files. You can read all of it in one sitting.
+
+## Runtime behavior
+
+Once booted, the system:
+
+1. Has exactly one user process: nginx (running as PID 1)
+2. Cannot load new kernel modules
+3. Cannot modify the root filesystem
+4. Cannot install or remove packages
+5. Cannot be accessed interactively
+
+The only interaction surface is HTTP requests to nginx on port 80.
+
+## Build process
+
+The build process is deterministic and reproducible:
+
+<Steps>
+  <Step title="Download Alpine minirootfs">
+    Downloads and verifies the Alpine Linux minimal root filesystem tarball.
+  </Step>
+  
+  <Step title="Install packages in chroot">
+    Installs nginx, kernel, and dependencies using apk in a chroot environment.
+  </Step>
+  
+  <Step title="Build custom initramfs">
+    Creates a minimal initramfs with busybox and kernel modules needed for boot.
+  </Step>
+  
+  <Step title="Harden the system">
+    Removes package manager, shell tools, documentation, and unnecessary binaries.
+  </Step>
+  
+  <Step title="Create squashfs">
+    Compresses the hardened root filesystem into a read-only squashfs image.
+  </Step>
+  
+  <Step title="Generate bootable ISO">
+    Packages the kernel, initramfs, and squashfs into a bootable ISO with ISOLINUX.
+  </Step>
+</Steps>
+
+<Note>
+On macOS, the entire build runs inside a Docker container using `alpine:3.21` to ensure compatibility.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Boot chain" icon="link" href="/architecture/boot-chain">
+    Learn how the system boots from BIOS to nginx
+  </Card>
+  <Card title="Security model" icon="shield" href="/architecture/security-model">
+    Understand the hardening measures and security guarantees
+  </Card>
+</CardGroup>
